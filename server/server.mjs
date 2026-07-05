@@ -15,18 +15,22 @@
 //
 // Config from env only (NO secrets in the repo):
 //   STARFRAG_PORT  (default 8791)   STARFRAG_HOST (default 127.0.0.1)
+//   STARFRAG_MAP   (default deck7-derelict; e.g. 'hangar-bay')
 
 import { WebSocketServer } from 'ws';
 import {
   C2S, S2C, TICK_HZ, RESPAWN_MS, PLAYER_HP, HIT_RADIUS,
   WEAPONS, DEFAULT_WEAPON, PLAYER_COLORS, PROTOCOL_VERSION,
 } from '../shared/protocol.js';
-import { compileMap, raycast } from '../shared/map.js';
+import { compileMap, raycast, pickArena } from '../shared/map.js';
 
 const PORT = +(process.env.STARFRAG_PORT || 8791);
 const HOST = process.env.STARFRAG_HOST || '127.0.0.1';
 
-const map = compileMap();            // { W, H, grid, spawns, ... }
+// Which deck to run. STARFRAG_MAP selects a registered arena id (e.g.
+// 'hangar-bay'); unset → the default derelict deck. Rotation is a future feature.
+const arena = pickArena(process.env.STARFRAG_MAP);
+const map = compileMap(arena);       // { W, H, grid, spawns, ... }
 const players = new Map();           // id -> player record
 let nextId = 1;
 let colorIx = 0;
@@ -151,6 +155,7 @@ wss.on('connection', (ws) => {
           id: p.id,
           spawn: { x: p.x, y: p.y, ang: p.ang },
           mapName: map.name,
+          mapId: map.id,
           players: [...players.values()].map(stateOf),
         });
         broadcast({ t: S2C.SPAWN, id: p.id, x: p.x, y: p.y, ang: p.ang });
