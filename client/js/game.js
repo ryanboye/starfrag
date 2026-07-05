@@ -899,6 +899,10 @@ Net.on(S2C.SPAWN, (m) => {
 // ---------------------------------------------------------------- input
 const keys = {};
 let fireHeld = false;
+// mobile twin-stick intent — additive, provably inert on desktop (tmove stays {0,0} and
+// touchFireHeld stays false unless the touch layer at the bottom of this file installs).
+const tmove = { f: 0, s: 0 };
+let touchFireHeld = false;
 if (!IS_BOT) {
   addEventListener('keydown', (e) => {
     if (window.PlaytestLink && (e.code === 'KeyT' || e.code === 'KeyM')) return; // owned by playtest-link
@@ -967,9 +971,10 @@ function frame(now) {
       if (keys.KeyS || keys.ArrowDown) f -= 1;
       if (keys.KeyA) s -= 1;
       if (keys.KeyD) s += 1;
+      f += tmove.f; s += tmove.s;                   // mobile twin-stick (0,0 on desktop)
       if (keys.ArrowLeft) me.ang -= 2.4 * dt;
       if (keys.ArrowRight) me.ang += 2.4 * dt;
-      if (fireHeld) fire();
+      if (fireHeld || touchFireHeld) fire();         // touchFireHeld: always false on desktop
     }
     if (!me.dead) {
       const len = Math.hypot(f, s); if (len > 1) { f /= len; s /= len; }
@@ -1149,6 +1154,8 @@ window.__game = {
   get players() { return Net.players.size; },
   get id() { return me.id; },
   get connected() { return Net.connected; },
+  get clip() { return me.clip; },                   // QA: rounds in the current magazine
+  get fireT() { return me.fireT; },                 // QA: last-shot timestamp (monotonic; advances per fired shot)
   snapshot() { return [...Net.players.values()]; }, // authoritative view of all players
   counts() { return { particles: particles.length, splats: splats.length, bolts: bolts.length }; }, // QA: feel-fx liveness
   get objective() { return objState; },             // QA: server objective snapshot (null on deathmatch)
@@ -1209,5 +1216,125 @@ if (window.PlaytestLink) try {
     keys: { mark: 'KeyM', invoke: 'KeyT' },
   });
 } catch (e) { console.warn('playtest-link init failed (non-fatal):', e && e.message); }
+
+// ---------------------------------------------------------------- mobile twin-stick
+// Pocket controls, touchscreen only: left thumb = floating move stick, right half =
+// look-drag (yaw), on-screen FIRE (hold) / RLD / MARK. Feeds the SAME movement intent
+// and fire() the desktop path uses (tmove + touchFireHeld, spliced into the loop).
+// Gated on a PRIMARY coarse pointer, so mouse devices — desktop AND touch-laptops —
+// install nothing here and stay byte-for-byte identical.
+(() => {
+  const coarse = window.matchMedia ? matchMedia('(pointer: coarse)').matches : ('ontouchstart' in window);
+  const TOUCH = coarse || params.get('touch') === '1';   // ?touch=1 = force controls (preview/verify; inert for real desktop)
+  if (!TOUCH || IS_BOT) return;
+  document.body.classList.add('touch');   // scopes the touch-only HUD shim below
+
+  const css = document.createElement('style');
+  css.textContent = `
+    #tc { position:fixed; inset:0; z-index:15; pointer-events:auto; touch-action:none;
+      -webkit-user-select:none; user-select:none; display:none; }
+    #tc .stick { position:fixed; width:118px; height:118px; border-radius:50%; pointer-events:none;
+      border:2px solid rgba(60,214,255,.45); background:rgba(60,214,255,.07);
+      transform:translate(-50%,-50%); display:none; }
+    #tc .knob { position:absolute; left:50%; top:50%; width:54px; height:54px; border-radius:50%;
+      pointer-events:none; background:rgba(60,214,255,.32); border:2px solid rgba(60,214,255,.85);
+      transform:translate(-50%,-50%); }
+    #tc .btn { position:fixed; pointer-events:auto; border-radius:50%; display:flex;
+      align-items:center; justify-content:center; font:600 11px 'Courier New',monospace;
+      letter-spacing:1px; touch-action:none; width:66px; height:66px; }
+    #tc .btn:active { filter:brightness(1.35); }
+    #tc .fire   { width:84px; height:84px; right:calc(env(safe-area-inset-right) + 18px);
+      bottom:calc(env(safe-area-inset-bottom) + 20px); background:rgba(255,60,74,.26);
+      border:2px solid var(--hot,#ff3c4a); color:#ffd7db; }
+    #tc .reload { right:calc(env(safe-area-inset-right) + 116px);
+      bottom:calc(env(safe-area-inset-bottom) + 20px); background:rgba(60,214,255,.14);
+      border:2px solid #3cd6ff; color:#bff0ff; }
+    #tc .mark   { right:calc(env(safe-area-inset-right) + 116px);
+      bottom:calc(env(safe-area-inset-bottom) + 98px); background:rgba(255,176,58,.14);
+      border:2px solid #ffb03a; color:#ffe0b0; }
+    /* lift the bottom-right ammo readout clear of the thumb cluster (touch only) */
+    body.touch #ammowrap { bottom:calc(env(safe-area-inset-bottom) + 178px); right:20px; }
+  `;
+  document.head.appendChild(css);
+
+  const mk = (cls, txt) => { const d = document.createElement('div'); d.className = cls; if (txt) d.textContent = txt; return d; };
+  const tc = mk('', ''); tc.id = 'tc';
+  const stick = mk('stick'), knob = mk('knob'); stick.appendChild(knob); tc.appendChild(stick);
+  const fireBtn = mk('btn fire', 'FIRE'), reloadBtn = mk('btn reload', 'RLD'), markBtn = mk('btn mark', 'MARK');
+  tc.append(fireBtn, reloadBtn, markBtn);
+  document.body.appendChild(tc);
+
+  // buttons own their touches — they never drive look/move
+  const btn = (node, down, up) => {
+    node.addEventListener('touchstart', (e) => { e.preventDefault(); e.stopPropagation(); down(); }, { passive: false });
+    if (up) {
+      const h = (e) => { e.preventDefault(); e.stopPropagation(); up(); };
+      node.addEventListener('touchend', h, { passive: false });
+      node.addEventListener('touchcancel', h, { passive: false });
+    }
+  };
+  btn(fireBtn, () => { touchFireHeld = true; }, () => { touchFireHeld = false; });
+  btn(reloadBtn, () => startReload());
+  btn(markBtn, () => { window.PlaytestLink && PlaytestLink.mark(); });
+
+  // field: simultaneous move (left half) + look (right half), tracked per touch id
+  const STICK_R = 46, TAP_PX = 12, LOOK = 0.006;
+  const look = new Map();                 // identifier -> { x, moved }
+  let moveId = null, ox = 0, oy = 0;
+
+  tc.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+      if (moveId === null && t.clientX < innerWidth / 2) {
+        moveId = t.identifier; ox = t.clientX; oy = t.clientY;
+        stick.style.left = ox + 'px'; stick.style.top = oy + 'px';
+        knob.style.left = '50%'; knob.style.top = '50%'; stick.style.display = 'block';
+      } else {
+        look.set(t.identifier, { x: t.clientX, moved: 0 });
+      }
+    }
+  }, { passive: false });
+
+  tc.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+      if (t.identifier === moveId) {
+        let dx = t.clientX - ox, dy = t.clientY - oy;
+        const m = Math.hypot(dx, dy);
+        if (m > STICK_R) { dx = dx / m * STICK_R; dy = dy / m * STICK_R; }
+        knob.style.left = `calc(50% + ${dx}px)`; knob.style.top = `calc(50% + ${dy}px)`;
+        tmove.f = -dy / STICK_R; tmove.s = dx / STICK_R;
+      } else {
+        const st = look.get(t.identifier); if (!st) continue;
+        const dx = t.clientX - st.x;
+        me.ang += dx * LOOK; st.moved += Math.abs(dx); st.x = t.clientX;
+      }
+    }
+  }, { passive: false });
+
+  const end = (e) => {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+      if (t.identifier === moveId) {
+        moveId = null; tmove.f = 0; tmove.s = 0; stick.style.display = 'none';
+      } else {
+        const st = look.get(t.identifier);
+        if (st) { if (st.moved < TAP_PX && started && !me.dead) fire(); look.delete(t.identifier); }
+      }
+    }
+  };
+  tc.addEventListener('touchend', end, { passive: false });
+  tc.addEventListener('touchcancel', end, { passive: false });
+
+  // controls show only in-play (hidden under the start / respawn overlay)
+  const sync = () => { const on = started ? 'block' : 'none'; if (tc.style.display !== on) tc.style.display = on; };
+  sync(); setInterval(sync, 200);
+
+  // touch-friendly overlay copy
+  const hint = document.querySelector('#overlay .keys');
+  if (hint) hint.textContent = 'LEFT drag move · RIGHT drag look · FIRE / RLD · 📣 report · MARK';
+  const go = document.querySelector('#overlay .go');
+  if (go) go.textContent = 'TAP TO ENTER THE ARENA';
+})();
 
 requestAnimationFrame(frame);
