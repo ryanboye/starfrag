@@ -8,7 +8,7 @@
 // every art path falls back to procedural shading until its asset loads. The map,
 // the wire protocol and the hitscan math all come from ../shared so client and
 // server agree exactly.
-import { WEAPONS, DEFAULT_WEAPON, C2S, S2C } from '../shared/protocol.js';
+import { WEAPONS, DEFAULT_WEAPON, C2S, S2C, OBJECTIVE } from '../shared/protocol.js';
 import { compileMap, raycast, isSolidCell, TEX, pickArena } from '../shared/map.js';
 import { Net } from './net.js';
 import { createBot } from './bot.js';
@@ -53,7 +53,8 @@ const me = {
   clip: WEAPONS[DEFAULT_WEAPON].clip, fireT: -1e9, reloadUntil: 0, wasReloading: false,
   dead: false, weapon: DEFAULT_WEAPON, id: null,
 };
-const cam = { kickY: 0, kickX: 0, roll: 0, dmgFlash: 0, shake: 0, hitstop: 0 };
+const cam = { kickY: 0, kickX: 0, roll: 0, dmgFlash: 0, shake: 0, hitstop: 0,
+  ventOffX: 0, ventOffY: 0, ventFlash: 0, door: 0, bodyPull: 0 };
 const vm = { flash: 0, kick: 0 };            // viewmodel fx
 // reactive crosshair: bloom grows with recoil/movement + tightens when still;
 // hit/kill are hit-marker pips that pop on a confirmed landed shot (server truth).
@@ -61,6 +62,46 @@ const cross = { bloom: 0, hit: 0, kill: 0 };
 let started = IS_BOT;                          // bots skip the click-to-start gate
 const flashUntil = new Map();                 // playerId -> ms, remote muzzle flash
 const killfeed = [];                          // { text, until }
+
+// ---------------------------------------------------------------- airlock objective (client render only)
+// PURELY COSMETIC. The server (S2C.OBJECTIVE, 20Hz) owns every truth — who owns a
+// console, when the door opens, who wins, who is vented. This client half only
+// READS `objState` and paints it: console props + capture rings, the bay-door
+// crank, the vent suck-toward-the-door drama, and the objective HUD. It makes ZERO
+// authoritative decisions (see docs/objective-contract.md).
+//   objState — latest OBJECTIVE snapshot (or welcome.objective), null on deck7.
+//   prevObj  — last snapshot, for edge-triggered SFX (arm / door-crank / vent).
+const airlock = world.airlock;                // static rect from the compiled deck (null on deathmatch)
+let objState = null;
+let prevObj = null;
+// Edge-detect phase/console changes to fire one-shot SFX + FX (no per-frame spam).
+function onObjective(m) {
+  const prev = prevObj;
+  // a console just finished capturing -> confirm chirp
+  if (prev && m.consoles) {
+    for (const c of m.consoles) {
+      const pc = prev.consoles && prev.consoles.find((x) => x.id === c.id);
+      if (c.armed && pc && !pc.armed) playSfx('console-arm', 0.55);
+    }
+  }
+  if (prev && prev.phase !== m.phase) {
+    if (m.phase === 'opening') playSfx('door-crank', 0.7);   // door begins to crank
+    if (m.phase === 'venting') {                             // the deck blows
+      playSfx('vent-whoosh', 0.85);
+      cam.ventFlash = 1; cam.shake += 4.5;
+    }
+  }
+  objState = m;
+  prevObj = m;
+}
+// Where the vent sucks toward: the airlock rect's inner mouth (world cells).
+function airlockPull() {
+  if (!airlock) return null;
+  const cx = airlock.x + airlock.w / 2;
+  // pull toward the door plane just inside the rect (north door => small y)
+  const cy = airlock.dir === 'south' ? airlock.y : airlock.y + airlock.h * 0.5;
+  return { cx, cy };
+}
 
 // ---------------------------------------------------------------- combat feel: particles + bolts
 // COMBAT-FEEL PASS (technique adapted from HULLROT's feel layer, sxs-doom/h-feel).
@@ -317,6 +358,28 @@ function skyPixel(az, y, t) {
   return packRGB(6, 8, 16); // the void, faintly blue
 }
 
+// A pixel of a bay-door blast leaf: gunmetal with horizontal ridges, a diagonal
+// hazard-chevron stripe across the middle, and a pulsing warning glow on the
+// leading edge as it cranks. v = vertical 0..1, df = across-door 0..1, edge = 0..1
+// proximity to the moving leaf edge, t = seconds.
+function doorPixel(v, df, edge, t) {
+  let r = 38, g = 43, b = 52;
+  const band = (v * 22) % 1;                         // ridge lines down the leaf
+  if (band < 0.14) { r += 22; g += 24; b += 28; }
+  else if (band > 0.84) { r -= 12; g -= 12; b -= 12; }
+  if (v > 0.4 && v < 0.6) {                          // hazard chevron stripe
+    const hz = ((v + df) * 12) % 1;
+    if (hz < 0.5) { r = 156; g = 116; b = 26; } else { r = 26; g = 25; b = 22; }
+  }
+  if (edge > 0.01) {                                 // leading-edge warning glow
+    const pu = 0.55 + 0.45 * Math.sin(t * 8);
+    r = Math.min(255, r + edge * 220 * pu);
+    g = Math.min(255, g + edge * 120 * pu);
+    b = Math.min(255, b + edge * 26 * pu);
+  }
+  return packRGB(r | 0, g | 0, b | 0);
+}
+
 // ---------------------------------------------------------------- renderer
 const WALLCOL = {
   [TEX.HULL]: [96, 88, 78], [TEX.TECH]: [74, 92, 116], [TEX.PANEL]: [128, 126, 134],
@@ -325,6 +388,9 @@ const WALLCOL = {
 
 function render(t) {
   const dirX = Math.cos(me.ang), dirY = Math.sin(me.ang);
+  // camera ORIGIN = true position + the vent suck offset (render-only; the real
+  // me.x/me.y is what we still send to the server, so the pull moves nothing).
+  const ex = me.x + cam.ventOffX, ey = me.y + cam.ventOffY;
   const tanH = Math.tan(FOV_HALF);
   const planeX = -dirY * tanH, planeY = dirX * tanH;
 
@@ -334,7 +400,7 @@ function render(t) {
   for (let y = HORIZON + 1; y < SCREEN_H; y++) {
     const d = rowDist[y];
     const m = fog(d);
-    let fx = me.x + d * rdx0, fy = me.y + d * rdy0;
+    let fx = ex + d * rdx0, fy = ey + d * rdy0;
     const sx = (d * (rdx1 - rdx0)) / SCREEN_W, sy = (d * (rdy1 - rdy0)) / SCREEN_W;
     let fi = y * SCREEN_W;
     const ci = (2 * HORIZON - y) * SCREEN_W;
@@ -360,7 +426,7 @@ function render(t) {
   for (let x = 0; x < SCREEN_W; x++) {
     const cameraX = (2 * x) / SCREEN_W - 1;
     const rdx = dirX + planeX * cameraX, rdy = dirY + planeY * cameraX;
-    const hit = raycast(world.grid, world.W, world.H, me.x, me.y, rdx, rdy, 64);
+    const hit = raycast(world.grid, world.W, world.H, ex, ey, rdx, rdy, 64);
     const dist = hit.dist;
     zbuf[x] = dist;
     const lineH = PROJ / dist;
@@ -369,11 +435,25 @@ function render(t) {
 
     if (hit.tex === TEX.VIEWPORT) {
       const az = Math.atan2(rdy, rdx);
+      // BAY-DOOR: on the airlock viewport, blast leaves shut over the window and
+      // CRANK apart as the objective opens (cam.door 0=shut .. 1=open). Two leaves
+      // meet at centre and retract to the sides. Cosmetic — reads the OBJECTIVE phase.
+      const isBayDoor = airlock && hit.mapY === airlock.y &&
+                        hit.mapX >= airlock.x && hit.mapX < airlock.x + airlock.w;
+      let covered = false, edge = 0, df = 0;
+      if (isBayDoor) {
+        df = (hit.mapX + hit.texX - airlock.x) / airlock.w;   // 0..1 across the door
+        df = df < 0 ? 0 : df > 1 ? 1 : df;
+        const lead = (1 - cam.door) * 0.5;                    // each leaf reaches this far in
+        covered = (df <= lead || df >= 1 - lead);
+        edge = Math.max(0, 1 - Math.min(Math.abs(df - lead), Math.abs(df - (1 - lead))) * 20);
+      }
       let fi = cy0 * SCREEN_W + x;
       for (let y = cy0; y < cy1; y++, fi += SCREEN_W) {
         const v = (y - y0) / lineH;
         // metal window frame top & bottom
         if (v < 0.1 || v > 0.9) { const m = fog(dist); fb[fi] = packRGB(60 * m | 0, 62 * m | 0, 70 * m | 0); }
+        else if (covered) fb[fi] = doorPixel(v, df, edge, t);
         else fb[fi] = skyPixel(az, y, t);
       }
       continue;
@@ -412,10 +492,16 @@ function render(t) {
 
   // --- sprites: other players (+ my own is skipped) ---
   const invDet = 1 / (planeX * dirY - dirX * planeY);
+  // during venting, other bodies visually slide toward the airlock (cosmetic; the
+  // server already decided who died — see the airlock killfeed). cam.bodyPull ramps.
+  const ap = cam.bodyPull > 0.001 ? airlockPull() : null;
   const list = [];
   for (const p of Net.players.values()) {
     if (p.id === me.id || p.dead) continue;
-    const relX = p.x - me.x, relY = p.y - me.y;
+    let px = p.x, py = p.y;
+    if (ap) { const dx = ap.cx - px, dy = ap.cy - py, L = Math.hypot(dx, dy) || 1;
+      px += (dx / L) * cam.bodyPull; py += (dy / L) * cam.bodyPull; }
+    const relX = px - ex, relY = py - ey;
     const tx = invDet * (dirY * relX - dirX * relY);
     const ty = invDet * (-planeY * relX + planeX * relY);
     if (ty > 0.2) list.push({ p, tx, ty });
@@ -479,7 +565,7 @@ function render(t) {
   // above, depth-tested against the wall zbuf so gore hides behind cover.
   // opaque flat point (blood particle / floor splat)
   function drawPoint(wx, wy, z, size, pr, pg, pb) {
-    const relX = wx - me.x, relY = wy - me.y;
+    const relX = wx - ex, relY = wy - ey;
     const ptx = invDet * (dirY * relX - dirX * relY);
     const pty = invDet * (-planeY * relX + planeX * relY);
     if (pty <= 0.2 || pty > 40) return;
@@ -502,7 +588,7 @@ function render(t) {
   }
   // additive glowing plasma bolt with a bright core + falloff halo
   function drawBolt(b) {
-    const relX = b.x - me.x, relY = b.y - me.y;
+    const relX = b.x - ex, relY = b.y - ey;
     const ptx = invDet * (dirY * relX - dirX * relY);
     const pty = invDet * (-planeY * relX + planeX * relY);
     if (pty <= 0.2 || pty > 40) return;
@@ -534,6 +620,86 @@ function render(t) {
   for (const sp of splats) drawPoint(sp.x, sp.y, 0.006, sp.size, sp.r, sp.g, sp.b);
   for (const p of particles) drawPoint(p.x, p.y, Math.max(0.02, p.z), p.size, p.r, p.g, p.b);
   for (const b of bolts) drawBolt(b);
+
+  // --- OBJECTIVE: console props + capture rings (world billboards) ---
+  // Reads objState only. Each console is a pedestal + emissive screen (owner's
+  // colour, neutral steel when unowned, white flicker when contested) with a
+  // radial capture RING that fills to `progress`. Depth-tested against the walls.
+  if (objState && objState.consoles) {
+    const R2 = OBJECTIVE.ARM_RADIUS * OBJECTIVE.ARM_RADIUS;
+    const nearCount = (c) => { let n = 0; for (const p of Net.players.values()) {
+      if (p.dead) continue; const dx = p.x - c.x, dy = p.y - c.y; if (dx * dx + dy * dy <= R2) n++; } return n; };
+    for (const c of objState.consoles) {
+      const relX = c.x - ex, relY = c.y - ey;
+      const ptx = invDet * (dirY * relX - dirX * relY);
+      const pty = invDet * (-planeY * relX + planeX * relY);
+      if (pty <= 0.25 || pty > 34) continue;
+      const sx = (SCREEN_W / 2) * (1 + ptx / pty);
+      const ccol = Math.round(sx);
+      if (ccol < 0 || ccol >= SCREEN_W || pty >= zbuf[ccol]) continue;   // off-screen / behind wall
+      const floorY = HORIZON + (0.5 * PROJ) / pty;
+      const hPx = (0.62 * PROJ) / pty;
+      const topY = floorY - hPx;
+      const halfW = Math.max(1.5, hPx * 0.34);
+      const fogm = Math.max(0.42, fog(pty));
+      const owned = c.owner != null && !!c.color;
+      const contested = !c.armed && nearCount(c) >= 2;
+      let cr, cg, cb;
+      if (contested) { cr = 235; cg = 245; cb = 255; }
+      else if (owned) { const g = hexRGB(c.color); cr = g[0]; cg = g[1]; cb = g[2]; }
+      else { cr = 96; cg = 150; cb = 172; }
+      const x0 = Math.max(0, Math.floor(sx - halfW)), x1 = Math.min(SCREEN_W - 1, Math.ceil(sx + halfW));
+      // pedestal body (gunmetal, edge-shaded) + emissive owner accent band
+      const bodyTop = Math.max(0, Math.floor(topY + hPx * 0.36));
+      const bodyBot = Math.min(SCREEN_H - 1, Math.floor(floorY));
+      for (let x = x0; x <= x1; x++) {
+        if (pty >= zbuf[x]) continue;
+        const edgeX = Math.min(1, Math.abs((x - sx) / halfW));
+        const sh = (1 - edgeX * 0.4) * fogm;
+        for (let y = bodyTop; y <= bodyBot; y++) {
+          const vy = (y - bodyTop) / Math.max(1, bodyBot - bodyTop);
+          let r = 46 * sh, g = 50 * sh, b = 58 * sh;
+          if (vy < 0.18) { r = cr * 0.5 * fogm; g = cg * 0.5 * fogm; b = cb * 0.5 * fogm; }  // accent band under screen
+          fb[y * SCREEN_W + x] = packRGB(r | 0, g | 0, b | 0);
+        }
+      }
+      // emissive screen head (pulses when armed)
+      const armPulse = c.armed ? (0.72 + 0.28 * Math.sin(t * 6 + c.x)) : (owned ? 0.85 : 0.5);
+      const headTop = Math.max(0, Math.floor(topY)), headBot = Math.min(SCREEN_H - 1, Math.floor(topY + hPx * 0.34));
+      for (let x = x0; x <= x1; x++) {
+        if (pty >= zbuf[x]) continue;
+        for (let y = headTop; y <= headBot; y++) {
+          const scan = ((y & 1) === 0) ? 1 : 0.72;   // scanline detail
+          const g2 = armPulse * scan * fogm;
+          fb[y * SCREEN_W + x] = packRGB(
+            Math.min(255, cr * g2 + 22) | 0, Math.min(255, cg * g2 + 22) | 0, Math.min(255, cb * g2 + 26) | 0);
+        }
+      }
+      // capture RING above the console — fills clockwise from the top to `progress`
+      if (objState.phase !== 'venting') {
+        const R = Math.max(3.5, hPx * 0.5);
+        const rcx = sx, rcy = topY - R * 0.85;
+        const segs = Math.max(28, (R * 2.2) | 0);
+        const prog = c.armed ? 1 : Math.max(0, Math.min(1, c.progress || 0));
+        for (let i = 0; i < segs; i++) {
+          const frac = i / segs;
+          const on = frac < prog;
+          const a = -Math.PI / 2 + frac * 2 * Math.PI;
+          const ca = Math.cos(a), sa = Math.sin(a);
+          for (let rr = R - 1.6; rr <= R + 0.4; rr += 0.6) {
+            const xx = Math.round(rcx + ca * rr), yy = Math.round(rcy + sa * rr);
+            if (xx < 0 || xx >= SCREEN_W || yy < 0 || yy >= SCREEN_H) continue;
+            if (pty >= zbuf[xx]) continue;
+            let r, g, b;
+            if (contested) { const fl = 0.5 + 0.5 * Math.sin(t * 22); r = 255 * fl + 60; g = 255 * fl + 60; b = 255; }
+            else if (on) { const br = c.armed ? (0.8 + 0.2 * Math.sin(t * 6)) : 1; r = cr * br + 40; g = cg * br + 40; b = cb * br + 40; }
+            else { r = 30; g = 40; b = 48; }   // unfilled track
+            fb[yy * SCREEN_W + xx] = packRGB(Math.min(255, r) | 0, Math.min(255, g) | 0, Math.min(255, b) | 0);
+          }
+        }
+      }
+    }
+  }
 
   octx.putImageData(img, 0, 0);
 }
@@ -663,7 +829,11 @@ function playSfx(name, vol = 0.5) {
 Net.onWelcome = (m) => {
   me.id = m.id; me.x = m.spawn.x; me.y = m.spawn.y; me.ang = m.spawn.ang;
   document.getElementById('arena').textContent = 'STARFRAG · ' + m.mapName;
+  // render the objective immediately from the welcome snapshot (null on deathmatch)
+  if (m.objective) { objState = m.objective; prevObj = m.objective; }
 };
+// server-authoritative objective state @20Hz — render only, decide nothing
+Net.on(S2C.OBJECTIVE, onObjective);
 Net.on(S2C.SHOT, (m) => {
   if (m.id === me.id) return;                 // my own bolt is spawned locally in fire()
   flashUntil.set(m.id, performance.now() + 90);
@@ -702,7 +872,11 @@ Net.on(S2C.HIT, (m) => {
 });
 Net.on(S2C.KILL, (m) => {
   const nm = m.names || {};
-  killfeed.push({ text: `${nm.by || m.by} ⟶ ${nm.id || m.id}`, until: performance.now() + 6000 });
+  // vent kills (weapon 'airlock') read as "VENTED" in the feed; normal frags stay ⟶
+  const text = m.weapon === 'airlock'
+    ? `${nm.by || m.by} ✦ VENTED ${nm.id || m.id}`
+    : `${nm.by || m.by} ⟶ ${nm.id || m.id}`;
+  killfeed.push({ text, until: performance.now() + 6000 });
   if (killfeed.length > 5) killfeed.shift();
   // I got the frag — kill-marker, a heavier hitstop punch + gib burst
   if (m.by === me.id && m.id !== me.id) {
@@ -822,6 +996,36 @@ function frame(now) {
     cross.bloom = Math.max(0, cross.bloom - dt * 4);      // crosshair tightens back
     cross.hit = Math.max(0, cross.hit - dt * 3.2);
     cross.kill = Math.max(0, cross.kill - dt * 2.5);
+
+    // --- OBJECTIVE camera FX (all cosmetic): bay-door crank + vent suck ---
+    // Reads objState/phase only; never touches me.x/me.y (what the server sees).
+    let doorTarget = 0;
+    if (objState && airlock) {
+      const ph = objState.phase, tot = objState.total || 1;
+      if (ph === 'arming') doorTarget = 0.06 + 0.22 * ((objState.armedCount || 0) / tot);   // cracks as consoles arm
+      else if (ph === 'opening') { const fr = objState.timer != null ? 1 - objState.timer / OBJECTIVE.DOOR_OPEN_MS : 1; doorTarget = 0.3 + 0.7 * Math.max(0, Math.min(1, fr)); }
+      else if (ph === 'venting') doorTarget = 1;           // idle stays 0 (shut)
+    }
+    cam.door += (doorTarget - cam.door) * Math.min(1, dt * 3.2);
+
+    const venting = !!(objState && objState.phase === 'venting');
+    const iAmWinner = venting && objState.winner && objState.winner.id === me.id;
+    if (venting && airlock) {
+      const ramp = objState.timer != null ? Math.max(0, Math.min(1, 1 - objState.timer / OBJECTIVE.VENT_MS)) : 1;
+      const ap = airlockPull();
+      const dx = ap.cx - me.x, dy = ap.cy - me.y, L = Math.hypot(dx, dy) || 1;
+      const camMax = iAmWinner ? 0.14 : 1.15;              // the holder braces; everyone else is sucked out
+      cam.ventOffX += ((dx / L) * camMax * ramp - cam.ventOffX) * Math.min(1, dt * 4);
+      cam.ventOffY += ((dy / L) * camMax * ramp - cam.ventOffY) * Math.min(1, dt * 4);
+      cam.bodyPull = (iAmWinner ? 0.5 : 2.0) * ramp;
+      if (!iAmWinner) cam.shake = Math.max(cam.shake, 1.0 + ramp * 1.6);
+      for (const p of particles) { const gx = ap.cx - p.x, gy = ap.cy - p.y, gl = Math.hypot(gx, gy) || 1; p.dx += (gx / gl) * 9 * dt; p.dy += (gy / gl) * 9 * dt; }
+    } else {
+      cam.ventOffX *= Math.max(0, 1 - dt * 3);
+      cam.ventOffY *= Math.max(0, 1 - dt * 3);
+      cam.bodyPull *= Math.max(0, 1 - dt * 4);
+    }
+    cam.ventFlash = Math.max(0, cam.ventFlash - dt * 1.4);
   }
 
   // send position to server ~20Hz (never gated — keep the connection warm)
@@ -892,6 +1096,37 @@ function updateHUD() {
   const nowMs = performance.now();
   while (killfeed.length && killfeed[0].until < nowMs) killfeed.shift();
   $('killfeed').innerHTML = killfeed.map((k) => `<div>${k.text}</div>`).join('');
+
+  // objective banner (only on objective decks — deck7 deathmatch stays blank)
+  updateObjectiveHUD();
+  const vf = $('ventflash'); if (vf) vf.style.opacity = cam.ventFlash * 0.55;
+}
+
+// The objective HUD: phase label, consoles armedCount/total with per-owner pips,
+// a phase timer, and the winner on the vent. Reads objState (server truth) only.
+function updateObjectiveHUD() {
+  const el = $('objective'); if (!el) return;
+  if (!objState) { el.style.display = 'none'; return; }
+  el.style.display = 'block';
+  const o = objState, tot = o.total || 0, armed = o.armedCount || 0;
+  const secs = o.timer != null ? Math.max(0, Math.ceil(o.timer / 1000)) : null;
+  let phaseTxt, sub, cls = '';
+  if (o.phase === 'opening') { phaseTxt = 'DEFEND THE AIRLOCK'; sub = secs != null ? `DOOR OPENING · ${secs}s` : 'DOOR OPENING'; cls = 'warn'; }
+  else if (o.phase === 'venting') {
+    const w = o.winner;
+    phaseTxt = w ? `${w.name} WINS` : 'THE VOID WINS';
+    sub = secs != null ? `VENTING · ${secs}s` : 'VENTING';
+    cls = 'vent';
+    if (w && w.color) el.style.setProperty('--win', w.color);
+  } else { phaseTxt = 'ARM THE CONSOLES'; sub = `CONSOLES ${armed}/${tot}`; }
+  const pips = (o.consoles || []).map((c) => {
+    const col = c.armed && c.color ? c.color : (c.owner != null && c.color ? c.color : '#3a4a52');
+    const fill = c.armed ? 1 : Math.max(0, Math.min(1, c.progress || 0));
+    return `<span class="pip" style="border-color:${col};box-shadow:0 0 5px ${c.armed ? col : 'transparent'}">`
+      + `<i style="background:${col};height:${Math.round(fill * 100)}%"></i></span>`;
+  }).join('');
+  el.className = 'hud ' + cls;
+  el.innerHTML = `<div class="phase">${phaseTxt}</div><div class="sub">${sub}</div><div class="pips">${pips}</div>`;
 }
 
 // ---------------------------------------------------------------- boot
@@ -916,6 +1151,9 @@ window.__game = {
   get connected() { return Net.connected; },
   snapshot() { return [...Net.players.values()]; }, // authoritative view of all players
   counts() { return { particles: particles.length, splats: splats.length, bolts: bolts.length }; }, // QA: feel-fx liveness
+  get objective() { return objState; },             // QA: server objective snapshot (null on deathmatch)
+  get door() { return cam.door; },                  // QA: bay-door crank 0..1
+  get ventPull() { return [+cam.ventOffX.toFixed(3), +cam.ventOffY.toFixed(3)]; }, // QA: render-only vent camera offset
   teleport(x, y, ang) { me.x = x; me.y = y; if (ang !== undefined) me.ang = ang; },
   setPos(x, y, ang) { this.teleport(x, y, ang); },
   fire() { me.fireT = -1e9; fire(); },

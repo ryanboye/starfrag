@@ -38,6 +38,21 @@
   #status { top:26px; left:12px; font-size:11px; opacity:0.7; }
   #dmgflash { position:absolute; inset:0; z-index:9; pointer-events:none;
     background:radial-gradient(circle, transparent 40%, var(--hot) 130%); opacity:0; }
+  #ventflash { position:absolute; inset:0; z-index:9; pointer-events:none;
+    background:radial-gradient(circle, transparent 25%, var(--cyan) 125%); opacity:0; }
+
+  /* objective banner (airlock win-mode; hidden on deathmatch decks) */
+  #objective { top:12px; left:50%; transform:translateX(-50%); text-align:center;
+    display:none; --win:var(--amber); }
+  #objective .phase { font-size:15px; font-weight:bold; letter-spacing:3px; color:var(--amber); }
+  #objective .sub { font-size:11px; opacity:0.85; margin-top:2px; color:var(--cyan); }
+  #objective.warn .phase { color:var(--hot); }
+  #objective.vent .phase { color:var(--win); text-shadow:0 0 10px var(--win); }
+  #objective.vent .sub { color:var(--hot); }
+  #objective .pips { margin-top:5px; display:flex; gap:6px; justify-content:center; }
+  #objective .pip { width:12px; height:14px; border:1px solid #3a4a52; position:relative;
+    display:inline-block; background:rgba(0,0,0,0.4); }
+  #objective .pip i { position:absolute; left:0; bottom:0; width:100%; display:block; }
 
   /* start / dead overlays */
   #overlay { position:absolute; inset:0; z-index:20; display:flex; flex-direction:column;
@@ -54,7 +69,9 @@
   <canvas id="screen" width="384" height="240"></canvas>
   <div id="cross"></div>
   <div id="dmgflash"></div>
+  <div id="ventflash"></div>
 
+  <div class="hud" id="objective"></div>
   <div class="hud" id="arena">STARFRAG · connecting…</div>
   <div class="hud" id="status"></div>
   <div class="hud" id="scoreboard"></div>
@@ -83,4 +100,4 @@
 <script src="playtest-link.js?v=rec1"></script>
 <!-- ?v bumped on client changes: Cloudflare caches js/* for 5d, the HTML is served
      fresh (cf-cache DYNAMIC), so a new query key is how a client edit reaches users. -->
-<script type="module" src="js/game.js?v=dir8"></script>
+<script type="module" src="js/game.js?v=airlock"></script>
