@@ -132,6 +132,15 @@ export const HANGAR_BAY = {
     { id: 'pickup-baydoor-health', type: 'pickup', kind: 'health', x: 16, y: 4 },
     { id: 'pickup-w-armor', type: 'pickup', kind: 'armor', x: 3, y: 16 },
     { id: 'pickup-e-armor', type: 'pickup', kind: 'armor', x: 28, y: 16 },
+
+    // --- AIRLOCK OBJECTIVE (Seb): four consoles ringing the docked dropship,
+    // each with a clear look north to the bay door. Capture all four to open the
+    // door and vent the deck. The airlock region IS the huge north bay door.
+    { id: 'console-nw', type: 'console', x: 5.5,  y: 10.5 },
+    { id: 'console-ne', type: 'console', x: 26.5, y: 10.5 },
+    { id: 'console-sw', type: 'console', x: 5.5,  y: 21.5 },
+    { id: 'console-se', type: 'console', x: 26.5, y: 21.5 },
+    { id: 'airlock-baydoor', type: 'airlock', x: 3, y: 0, w: 26, h: 2, dir: 'north' },
   ],
 };
 
@@ -155,6 +164,8 @@ export function compileMap(arena = ARENA) {
   const spawns = [];
   const pickups = [];
   const viewports = [];
+  const consoles = [];   // airlock-objective capture points (floor devices, not solid)
+  let airlock = null;    // the vent region (a bay door) the objective opens
 
   const put = (x, y, tex) => {
     if (x < 0 || y < 0 || x >= W || y >= H) return;
@@ -186,9 +197,17 @@ export function compileMap(arena = ARENA) {
       case 'pickup':
         pickups.push({ id: e.id, kind: e.kind, x: e.x, y: e.y });
         break;
+      // Airlock-objective entities. Consoles are floor devices (NOT put in the
+      // grid — players stand on them to channel), the airlock is the vent region.
+      case 'console':
+        consoles.push({ id: e.id, x: e.x, y: e.y });
+        break;
+      case 'airlock':
+        airlock = { id: e.id, x: e.x, y: e.y, w: e.w, h: e.h, dir: e.dir || 'north' };
+        break;
     }
   }
-  return { W, H, grid, spawns, pickups, viewports, id: arena.id, name: arena.name, sky: arena.sky };
+  return { W, H, grid, spawns, pickups, viewports, consoles, airlock, id: arena.id, name: arena.name, sky: arena.sky };
 }
 
 // Is a world cell solid? VIEWPORT counts as solid wall for collision + occlusion.

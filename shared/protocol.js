@@ -18,6 +18,23 @@ export const RESPAWN_MS = 2500;   // delay from death to respawn
 export const PLAYER_HP = 100;
 export const HIT_RADIUS = 0.55;   // how close a hitscan ray must pass to a body
 
+// --- Airlock objective mode -------------------------------------------------
+// A server-authoritative capture-point win mode, active ONLY on decks that
+// define `console` + `airlock` entities in their map data (e.g. hangar-bay).
+// Deathmatch decks (deck7) simply omit them and this stays dormant.
+//   loop: channel all consoles -> bay-door opens -> the deck vents ->
+//         every player but the majority console-holder is sucked out -> they win.
+// Movement is client-authoritative, so the server does NOT move anyone: the vent
+// KILL is server-decided (truth), while the suck-toward-the-door PULL is the
+// client's visual (spectacle). The two never disagree about who won or died.
+export const OBJECTIVE = {
+  MODE: 'airlock',
+  ARM_MS: 2000,        // cumulative proximity (ms) to fully capture one console
+  ARM_RADIUS: 1.35,    // how close (cells) a live player must be to channel it
+  DOOR_OPEN_MS: 1500,  // telegraph window: door cranks open before the vent fires
+  VENT_MS: 2500,       // the vent spectacle window (the kill lands at its start)
+};
+
 // The one and only weapon in the scaffold: the "PULSE CARBINE".
 // New weapons are added here + in the client viewmodel — see CONTRIBUTING.md.
 export const WEAPONS = {
@@ -54,6 +71,12 @@ export const S2C = {
   SPAWN:   'spawn',   // { id, x, y, ang }     -> player (re)spawned
   LEAVE:   'leave',   // { id }
   PONG:    'pong',    // { ts }
+  // Airlock objective state, broadcast every tick on decks that have it:
+  //   { mode, phase:'idle'|'arming'|'opening'|'venting', total,
+  //     armedCount, consoles:[{id,x,y,owner,color,progress,armed}],
+  //     airlock:{x,y,w,h,dir}, timer:<ms left in phase|null>, winner:{id,name,color}|null }
+  // Vent kills also arrive as normal S2C.KILL with weapon:'airlock' (killfeed = "vented").
+  OBJECTIVE: 'objective',
 };
 
 // Distinct player colors, handed out round-robin by the server.
