@@ -31,7 +31,7 @@ freely. Status: `open` · `claimed` · `in progress` · `done`. See
 | feature                                        | owner   | status |
 |------------------------------------------------|---------|--------|
 | Engineering deck (reactor hazard, catwalks)    | _open_  | open   |
-| Hangar bay (huge viewport, open sightlines)    | _open_  | open   |
+| Hangar bay (huge viewport, open sightlines)    | seb     | in progress |
 | Cryo-quarters (tight corridors, ambush maze)   | _open_  | open   |
 | Map rotation / voting between rounds           | _open_  | open   |
 
