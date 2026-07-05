@@ -1,14 +1,15 @@
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>STARFRAG</title>
 <style>
   :root { --amber:#ffb03a; --cyan:#3cd6ff; --hot:#ff3c4a; }
   * { margin:0; padding:0; box-sizing:border-box; }
   html, body { height:100%; background:#05060a; overflow:hidden;
-    font-family:'Courier New', monospace; color:var(--amber); }
+    font-family:'Courier New', monospace; color:var(--amber);
+    touch-action:none; overscroll-behavior:none; -webkit-text-size-adjust:100%; }
   #app { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; }
   #screen { image-rendering:pixelated; background:#05060a; cursor:crosshair;
-    width:100%; height:100%; object-fit:contain; }
+    width:100%; height:100%; object-fit:contain; touch-action:none; }
 
   /* crosshair */
   #cross { position:absolute; left:50%; top:50%; width:18px; height:18px;
@@ -100,4 +101,4 @@
 <script src="playtest-link.js?v=rec1"></script>
 <!-- ?v bumped on client changes: Cloudflare caches js/* for 5d, the HTML is served
      fresh (cf-cache DYNAMIC), so a new query key is how a client edit reaches users. -->
-<script type="module" src="js/game.js?v=airlock"></script>
+<script type="module" src="js/game.js?v=mobile1"></script>
