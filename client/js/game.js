@@ -9,7 +9,7 @@
 // the wire protocol and the hitscan math all come from ../shared so client and
 // server agree exactly.
 import { WEAPONS, DEFAULT_WEAPON, C2S, S2C } from '../shared/protocol.js';
-import { compileMap, raycast, isSolidCell, TEX } from '../shared/map.js';
+import { compileMap, raycast, isSolidCell, TEX, pickArena } from '../shared/map.js';
 import { Net } from './net.js';
 import { createBot } from './bot.js';
 
@@ -19,8 +19,11 @@ const FOV_HALF = 0.6;
 const PROJ = (SCREEN_W / 2) / Math.tan(FOV_HALF);
 const FOG_K = 0.085;
 
-const world = compileMap();                 // { W, H, grid, spawns, pickups, sky, name }
 const params = new URLSearchParams(location.search);
+// Which deck to render. ?map=<id> (e.g. hangar-bay) picks a registered arena;
+// default is the derelict deck. The server authoritative-picks via STARFRAG_MAP —
+// launch both with the same id (auto-sync between them is the map-rotation feature).
+const world = compileMap(pickArena(params.get('map')));
 const IS_BOT = params.get('bot') === '1';
 const MY_NAME = (params.get('name') || (IS_BOT ? 'bot' : 'player')).slice(0, 16);
 
@@ -151,6 +154,13 @@ loadSprite(ART_DIR + 'trooper.png', (s) => { trooperSprite = s; });
 loadSprite(ART_DIR + 'carbine.png', (s) => { gunSprite = s; });
 
 // ---------------------------------------------------------------- sky / viewport
+// The planet's base colour is the deck's sky.planetTint (parsed once here — skyPixel
+// runs per-pixel), falling back to the classic blue. Lets each deck hang its own world.
+const PLANET_RGB = (() => {
+  const hex = String((world.sky && world.sky.planetTint) || '').replace('#', '');
+  if (/^[0-9a-fA-F]{6}$/.test(hex)) { const n = parseInt(hex, 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+  return [0x5a, 0x7f, 0xa8];
+})();
 // A pixel of the window-to-space: rotating planet + twinkling starfield, keyed
 // to view azimuth so turning pans it and walking never smears it.
 function skyPixel(az, y, t) {
@@ -170,7 +180,7 @@ function skyPixel(az, y, t) {
     light = Math.max(0.06, Math.min(1, light));
     const atmo = r2 > R * R * 0.86 ? 1.5 : 1;           // brighter limb
     const br = (0.35 + 0.65 * band) * light * atmo;
-    const cr = 0x5a, cg = 0x7f, cb = 0xa8;              // planet base tint
+    const cr = PLANET_RGB[0], cg = PLANET_RGB[1], cb = PLANET_RGB[2];   // deck's sky.planetTint
     return packRGB(Math.min(255, cr * br * 1.4) | 0, Math.min(255, cg * br * 1.4) | 0, Math.min(255, cb * br * 1.6) | 0);
   }
   // stars
