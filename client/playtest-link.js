@@ -33,11 +33,15 @@ window.PlaytestLink = (() => {
     rec.start(1000);
     return rec;
   }
-  function cycleRecorders() { // double-buffer: always ≥15s of playable webm available
+  function cycleRecorders() { // double-buffer: always clipSec..2×clipSec of playable webm (default ~6-12s)
     liveIsA = !liveIsA;
     const old = liveIsA ? recB : recA;
     if (liveIsA) recA = startRec(true); else recB = startRec(false);
-    setTimeout(() => { try { old && old.state !== 'inactive' && old.stop(); } catch {} }, 5500);
+    // stop delay derived from clipSec: < cycle so the old recorder never outlives its
+    // buffer-slot reuse (stream corruption at low clipSec), with a >=400ms latency margin.
+    const cyc = (cfg.clipSec || 6) * 1000;
+    const stopDelay = Math.max(400, Math.min(cyc * 0.85, cyc - 400));
+    setTimeout(() => { try { old && old.state !== 'inactive' && old.stop(); } catch {} }, stopDelay);
   }
 
   function pushError(entry) {
