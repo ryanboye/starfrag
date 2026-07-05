@@ -20,7 +20,7 @@
 import { WebSocketServer } from 'ws';
 import {
   C2S, S2C, TICK_HZ, RESPAWN_MS, PLAYER_HP, HIT_RADIUS,
-  WEAPONS, DEFAULT_WEAPON, PLAYER_COLORS, PROTOCOL_VERSION,
+  WEAPONS, DEFAULT_WEAPON, PLAYER_COLORS, PROTOCOL_VERSION, OBJECTIVE,
 } from '../shared/protocol.js';
 import { compileMap, raycast, pickArena } from '../shared/map.js';
 
@@ -83,6 +83,109 @@ function respawn(p) {
   p.clip = WEAPONS[DEFAULT_WEAPON].clip;
   p.reloadUntil = 0; p.respawnAt = 0;
   broadcast({ t: S2C.SPAWN, id: p.id, x: p.x, y: p.y, ang: p.ang });
+}
+
+// --- AIRLOCK OBJECTIVE: server-authoritative capture-point win mode ---------
+// Dormant unless the compiled deck defines an airlock + consoles (hangar-bay).
+// Loop: a live player standing on a console channels it to their name; hold all
+// consoles at once -> the bay door opens -> the deck vents -> everyone but the
+// majority console-holder is sucked out and the holder wins the round.
+//
+// Authority split: the server NEVER moves a player (movement is client-auth), so
+// the vent KILL is decided here (truth) while the suck-toward-the-door PULL is
+// purely the client's visual (spectacle). See shared/protocol.js OBJECTIVE.
+const OBJ = map.airlock ? {
+  phase: 'idle',              // idle -> arming -> opening -> venting -> (reset to idle)
+  phaseUntil: 0,             // Date.now() the current timed phase ends (opening/venting)
+  winner: null,              // { id, name, color } once a vent resolves
+  lastArmer: null,           // player id who completed the most recent console (tie-break)
+  consoles: map.consoles.map((c) => ({
+    id: c.id, x: c.x, y: c.y, owner: null, color: null, progress: 0, armed: false,
+  })),
+} : null;
+
+function objDist2(p, c) { const dx = p.x - c.x, dy = p.y - c.y; return dx * dx + dy * dy; }
+
+// Public objective snapshot for the wire — the client renders exactly this.
+function objectiveView(now) {
+  return {
+    mode: OBJECTIVE.MODE,
+    phase: OBJ.phase,
+    total: OBJ.consoles.length,
+    armedCount: OBJ.consoles.filter((c) => c.armed).length,
+    consoles: OBJ.consoles.map((c) => ({
+      id: c.id, x: c.x, y: c.y, owner: c.owner, color: c.color,
+      progress: +c.progress.toFixed(3), armed: c.armed,
+    })),
+    airlock: map.airlock,
+    timer: OBJ.phaseUntil ? Math.max(0, OBJ.phaseUntil - now) : null,
+    winner: OBJ.winner,
+  };
+}
+
+function resetObjective() {
+  OBJ.phase = 'idle'; OBJ.phaseUntil = 0; OBJ.winner = null; OBJ.lastArmer = null;
+  for (const c of OBJ.consoles) { c.owner = null; c.color = null; c.progress = 0; c.armed = false; }
+}
+
+// The vent. Winner = whoever holds the most consoles (tie -> who armed the last
+// one). Every other live player is sucked out the airlock (a server-side kill).
+function ventTheDeck(now) {
+  const tally = new Map();
+  for (const c of OBJ.consoles) if (c.owner != null) tally.set(c.owner, (tally.get(c.owner) || 0) + 1);
+  let winnerId = null, best = -1;
+  for (const [id, n] of tally) {
+    if (n > best || (n === best && id === OBJ.lastArmer)) { best = n; winnerId = id; }
+  }
+  const w = winnerId != null ? players.get(winnerId) : null;
+  OBJ.winner = w ? { id: w.id, name: w.name, color: w.color } : null;
+  if (w) w.frags += 1;                         // a round win counts as a frag
+
+  for (const p of players.values()) {
+    if (!p.joined || p.dead) continue;
+    if (w && p.id === w.id) continue;          // the holder rides it out
+    p.dead = true; p.hp = 0; p.respawnAt = now + RESPAWN_MS;
+    broadcast({
+      t: S2C.KILL, id: p.id, by: w ? w.id : p.id, weapon: 'airlock',
+      names: { id: p.name, by: w ? w.name : 'THE VOID' },
+    });
+  }
+}
+
+function updateObjective(now) {
+  if (!OBJ) return;
+  if (OBJ.phase === 'idle' || OBJ.phase === 'arming') {
+    const rate = (1000 / TICK_HZ) / OBJECTIVE.ARM_MS;
+    const R2 = OBJECTIVE.ARM_RADIUS * OBJECTIVE.ARM_RADIUS;
+    for (const c of OBJ.consoles) {
+      let near = null, nCount = 0;
+      for (const p of players.values()) {
+        if (p.joined && !p.dead && objDist2(p, c) <= R2) { near = p; nCount++; }
+      }
+      if (nCount === 1) {
+        if (c.owner === near.id) { c.progress = 1; c.armed = true; }      // owner holds/tops off
+        else if (c.owner != null) {                                       // enemy neutralizes first
+          c.progress -= rate;
+          if (c.progress <= 0) { c.progress = 0; c.owner = null; c.color = null; c.armed = false; }
+        } else {                                                          // unowned -> capture
+          c.progress += rate;
+          if (c.progress >= 1) {
+            c.progress = 1; c.owner = near.id; c.color = near.color; c.armed = true; OBJ.lastArmer = near.id;
+          }
+        }
+      }
+      // nCount === 0 -> hold (armed stays armed, partials sit); >= 2 -> contested freeze
+    }
+    const armed = OBJ.consoles.filter((c) => c.armed).length;
+    OBJ.phase = armed > 0 ? 'arming' : 'idle';
+    if (OBJ.consoles.length > 0 && armed === OBJ.consoles.length) {
+      OBJ.phase = 'opening'; OBJ.phaseUntil = now + OBJECTIVE.DOOR_OPEN_MS;   // lock in; door cranks open
+    }
+  } else if (OBJ.phase === 'opening') {
+    if (now >= OBJ.phaseUntil) { OBJ.phase = 'venting'; OBJ.phaseUntil = now + OBJECTIVE.VENT_MS; ventTheDeck(now); }
+  } else if (OBJ.phase === 'venting') {
+    if (now >= OBJ.phaseUntil) resetObjective();
+  }
 }
 
 // Authoritative hitscan: fire one ray per pellet from the shooter, stop at the
@@ -157,6 +260,7 @@ wss.on('connection', (ws) => {
           mapName: map.name,
           mapId: map.id,
           players: [...players.values()].map(stateOf),
+          objective: OBJ ? objectiveView(Date.now()) : null,
         });
         broadcast({ t: S2C.SPAWN, id: p.id, x: p.x, y: p.y, ang: p.ang });
         break;
@@ -201,5 +305,7 @@ setInterval(() => {
   for (const p of players.values()) {
     if (p.dead && p.respawnAt && now >= p.respawnAt) respawn(p);
   }
+  updateObjective(now);
   broadcast({ t: S2C.STATE, players: [...players.values()].filter((p) => p.joined).map(stateOf) });
+  if (OBJ) broadcast({ t: S2C.OBJECTIVE, ...objectiveView(now) });
 }, 1000 / TICK_HZ);
