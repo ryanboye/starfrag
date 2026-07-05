@@ -15,7 +15,8 @@ const angDiff = (a, b) => {
 };
 
 export function createBot(api) {
-  const s = { waypoint: null, repath: 0, strafe: 1, strafeT: 0, fireCd: 0 };
+  const s = { waypoint: null, repath: 0, strafe: 1, strafeT: 0, fireCd: 0,
+    aimErr: 0, reactT: 0, lastTarget: null };  // human-fair aim state (no aimbot)
 
   // clear line of sight from (x0,y0) to (x1,y1)? (wall between them blocks it)
   function los(x0, y0, x1, y1) {
@@ -51,12 +52,19 @@ export function createBot(api) {
     const target = nearestEnemy(me);
 
     if (target) {
-      // aim: rotate toward the target, capped so it's not a perfect aimbot
-      const want = Math.atan2(target.y - me.y, target.x - me.x);
+      // HUMAN-FAIR AIM — deliberately NOT an aimbot (awfml's rule). Three handicaps:
+      //  (1) reaction delay when a new target appears, (2) a wandering aim error that
+      //  grows with range, (3) a capped turn speed so it can't snap-track.
+      if (target !== s.lastTarget) { s.reactT = 0.28 + Math.random() * 0.24; s.lastTarget = target; }
+      s.reactT -= dt;
+      s.aimErr = Math.max(-0.3, Math.min(0.3, s.aimErr * 0.96 + (Math.random() - 0.5) * dt * 2.2));
+      const rangeErr = Math.min(0.18, target._d * 0.013);            // farther = sloppier
+      const want = Math.atan2(target.y - me.y, target.x - me.x)
+        + s.aimErr * (0.6 + rangeErr * 3) + (Math.random() - 0.5) * rangeErr;
       const d = angDiff(want, me.ang);
-      me.ang += Math.max(-6 * dt, Math.min(6 * dt, d));
-      const aligned = Math.abs(angDiff(want, me.ang)) < 0.12;
-      if (aligned && me.clip > 0 && s.fireCd <= 0) { api.fire(); s.fireCd = 0.11; }
+      me.ang += Math.max(-3.4 * dt, Math.min(3.4 * dt, d));           // was 6 (snap-track)
+      const aligned = Math.abs(angDiff(want, me.ang)) < 0.10;
+      if (aligned && s.reactT <= 0 && me.clip > 0 && s.fireCd <= 0) { api.fire(); s.fireCd = 0.13; }
 
       // keep a mid fighting distance while strafing to dodge
       s.strafeT -= dt;

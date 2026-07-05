@@ -371,7 +371,7 @@ function drawGun(ctx, t) {
   if (rem > 0) { const k = 1 - rem / wp.reloadMs; dip = Math.sin(k * Math.PI) * 46; roll = Math.sin(k * Math.PI) * 0.25; }
 
   const cx = SCREEN_W / 2 + bx + cam.kickX * 0.4;
-  const baseY = SCREEN_H + kick + dip + by + cam.kickY * 0.3;
+  const baseY = SCREEN_H + 26 + kick + dip + by + cam.kickY * 0.3;  // sit lower (awfml: was hogging the screen)
 
   let muzzleY = baseY - 120;   // procedural fallback muzzle height
   ctx.save();
@@ -379,7 +379,7 @@ function drawGun(ctx, t) {
   ctx.rotate(roll);
   if (gunSprite) {
     // real POV pulse carbine (sprite-forge / gpt-image-2), anchored bottom-centre
-    const gw = SCREEN_W * 0.7;
+    const gw = SCREEN_W * 0.54;   // was 0.7 — smaller so it doesn't block the view
     const gh = gw * (gunSprite.h / gunSprite.w);
     ctx.imageSmoothingEnabled = true;
     ctx.drawImage(gunSprite.canvas, -gw / 2, -gh, gw, gh);
