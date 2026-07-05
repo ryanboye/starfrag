@@ -21,7 +21,8 @@ with the forge keyer (so the committed PNGs stay raw/regenerable):
 | `art/wall_panel.png` | Scenario flux (flux.1-dev) | 256² | `TEX.PANEL` (cover) | wall column sampler |
 | `art/floor_deck.png` | Scenario flux (flux.1-dev) | 256² | floor plane | floor caster sampler |
 | `art/carbine.png`    | gpt-image-2 | 800×533 | POV pulse-carbine viewmodel | `drawGun()` (bob/kick/dip) |
-| `art/trooper.png`    | gpt-image-2 | 400×600 | enemy billboard | sprite blitter (`Net.players`) |
+| `art/trooper.png`    | gpt-image-2 | 400×600 | enemy billboard — **front (S)** of the 8-way set | sprite blitter (`Net.players`) |
+| `art/trooper_{se,e,ne,n,nw,w,sw}.png` | gpt-image-2 **images/edits** (img2img from `trooper.png`) | 400×600 | 7 other yaw views of the SAME trooper | 8-way directional pick (`pickTrooper`) |
 
 `TEX.REACTOR` stays procedural (pulsing orange emissive) and `TEX.VIEWPORT` stays the
 raycast starfield/planet — both intentionally not textured. The muzzle flash is a
@@ -51,6 +52,12 @@ separate additive code overlay drawn at the carbine barrel tip on fire (never ba
   facing camera. Heavy armored space marine in dark tactical armor, full helmet with a
   glowing red-orange visor, rifle across the chest. Whole body in frame, feet at bottom.
   Solid flat pure magenta #FF00FF background, no ground, no shadow." (aspect 2:3)
+- **trooper_{se..sw}** (8-way turnaround) — derived from `trooper.png` (the front/S
+  view) with **gpt-image-2 `images/edits`** (img2img holds identity best across angles;
+  see sprite-forge LEARNINGS): each call re-states the identity anchors (dark gunmetal
+  armor, red-visor helmet, '09' pauldron, skull knee decal, pulse carbine) and asks for
+  one rotated view (front-3/4, side profile, rear-3/4, direct rear). Generated 1024×1536,
+  flattened onto magenta, downscaled to 400×600. Tool: `generators/gen-edit.mjs`.
 
 ## Regenerating
 

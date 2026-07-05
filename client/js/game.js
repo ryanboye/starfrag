@@ -241,9 +241,35 @@ const WALLTEX = {
   [TEX.PILLAR]: loadWallTex(ART_DIR + 'wall_hull.png'),
 };
 const deckTex = loadWallTex(ART_DIR + 'floor_deck.png');
-let trooperSprite = null, gunSprite = null;
-loadSprite(ART_DIR + 'trooper.png', (s) => { trooperSprite = s; });
+let gunSprite = null;
 loadSprite(ART_DIR + 'carbine.png', (s) => { gunSprite = s; });
+
+// 8-way directional enemy billboards (Doom/Build-engine style). Index = the VIEW
+// the camera sees, going around the compass from S(front) counter-clockwise:
+// [0:S 1:SE 2:E 3:NE 4:N 5:NW 6:W 7:SW]. S(front) reuses the canonical trooper.png;
+// the other 7 are gpt-image-2 img2img angle-derivations of it (identity-locked,
+// same armor/helmet/carbine — see ART.md). Each loads async; any slot not yet
+// loaded falls back to the front sprite, then to the procedural trooper. The frame
+// is chosen per-enemy from the angle between our line-of-sight and their server yaw.
+const DIR8_FILES = ['trooper.png', 'trooper_se.png', 'trooper_e.png', 'trooper_ne.png',
+                    'trooper_n.png', 'trooper_nw.png', 'trooper_w.png', 'trooper_sw.png'];
+const trooperDir = new Array(8).fill(null);
+DIR8_FILES.forEach((f, i) => loadSprite(ART_DIR + f, (s) => { trooperDir[i] = s; }));
+// Flip to -1 if a strafing enemy shows the wrong side (mirrors the two side-arcs;
+// the front/back anchors are unaffected). Verified by screenshot at wire-in time.
+const DIR8_HANDED = 1;
+// Pick the directional sprite for enemy p as seen from the viewer at (me.x,me.y).
+// rel = enemyYaw - angle(enemy->viewer): 0 => they face us (front/S), π => their
+// back (N), ±π/2 => a side. Quantize to 8 buckets; fall back while art loads.
+function pickTrooper(p) {
+  const front = trooperDir[0];
+  if (!front || !front.px) return { spr: trooper, real: false };
+  const angToViewer = Math.atan2(me.y - p.y, me.x - p.x);
+  let bucket = Math.round(((p.ang || 0) - angToViewer) / (Math.PI / 4));
+  bucket = (((bucket * DIR8_HANDED) % 8) + 8) % 8;
+  const cand = trooperDir[bucket];
+  return { spr: (cand && cand.px) ? cand : front, real: true };
+}
 
 // ---------------------------------------------------------------- sky / viewport
 // The planet's base colour is the deck's sky.planetTint (parsed once here — skyPixel
@@ -396,9 +422,9 @@ function render(t) {
   const nowMs = performance.now();
   for (const s of list) {
     const { p, tx, ty } = s;
-    // real trooper art when loaded (drawn full-colour); tinted procedural fallback
-    const spr = (trooperSprite && trooperSprite.px) ? trooperSprite : trooper;
-    const real = spr === trooperSprite;
+    // real trooper art when loaded (8-way directional, drawn full-colour); tinted
+    // procedural fallback until the sprites load. Frame = enemy facing vs our view.
+    const { spr, real } = pickTrooper(p);
     const screenX = (SCREEN_W / 2) * (1 + tx / ty);
     const hPx = (1.15 * PROJ) / ty;
     const wPx = hPx * (spr.w / spr.h);
