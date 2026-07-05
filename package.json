@@ -1,0 +1,20 @@
+{
+  "name": "starfrag",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "STARFRAG — a 2.5D, Quake-style multiplayer arena shooter aboard a derelict orbital station.",
+  "license": "MIT",
+  "scripts": {
+    "start": "node server/server.mjs",
+    "server": "node server/server.mjs",
+    "dev": "node tools/static.mjs",
+    "bot": "node bot.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "playwright": "^1.48.0"
+  }
+}

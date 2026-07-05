@@ -1,0 +1,8 @@
+node_modules/
+*.log
+npm-debug.log*
+.DS_Store
+playtest-inbox/
+client/assets/sfx/*.mp3
+!client/assets/sfx/.gitkeep
+.env

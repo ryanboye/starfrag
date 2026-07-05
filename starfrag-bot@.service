@@ -1,0 +1,29 @@
+# STARFRAG bot player — systemd USER service template.
+# Each contributor runs their own named bot; %i is the bot name.
+#
+# Install (once):
+#   cp starfrag-bot@.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+# Launch a bot named "reaper":
+#   systemctl --user start starfrag-bot@reaper
+#   systemctl --user status starfrag-bot@reaper
+#   journalctl --user -u starfrag-bot@reaper -f
+# Stop it:
+#   systemctl --user stop starfrag-bot@reaper
+#
+# Point it elsewhere by editing STARFRAG_URL below (defaults to the live arena).
+
+[Unit]
+Description=STARFRAG bot player (%i)
+After=network.target
+
+[Service]
+Environment=BOT_NAME=%i
+Environment=STARFRAG_URL=https://bmo.ryanboye.com/starfrag/
+WorkingDirectory=/home/claudebot/starfrag
+ExecStart=/usr/bin/node /home/claudebot/starfrag/bot.mjs
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

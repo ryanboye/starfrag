@@ -1,0 +1,84 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>STARFRAG</title>
+<style>
+  :root { --amber:#ffb03a; --cyan:#3cd6ff; --hot:#ff3c4a; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { height:100%; background:#05060a; overflow:hidden;
+    font-family:'Courier New', monospace; color:var(--amber); }
+  #app { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; }
+  #screen { image-rendering:pixelated; background:#05060a; cursor:crosshair;
+    width:100%; height:100%; object-fit:contain; }
+
+  /* crosshair */
+  #cross { position:absolute; left:50%; top:50%; width:18px; height:18px;
+    transform:translate(-50%,-50%); pointer-events:none; z-index:10; opacity:0.85; }
+  #cross::before, #cross::after { content:''; position:absolute; background:var(--cyan); }
+  #cross::before { left:8px; top:0; width:2px; height:18px; }
+  #cross::after { top:8px; left:0; height:2px; width:18px; }
+
+  /* HUD */
+  .hud { position:absolute; z-index:11; pointer-events:none;
+    text-shadow:0 0 6px rgba(0,0,0,0.9); letter-spacing:1px; }
+  #arena { top:10px; left:12px; font-size:12px; color:var(--cyan); opacity:0.75; }
+  #hpwrap { bottom:14px; left:16px; }
+  #hpwrap .lbl { font-size:10px; opacity:0.6; }
+  #hp { font-size:30px; font-weight:bold; line-height:1; }
+  #hpbar { width:150px; height:6px; margin-top:4px; background:#221; border:1px solid #443; }
+  #hpbar i { display:block; height:100%; width:100%; background:var(--amber); }
+  #ammowrap { bottom:14px; right:16px; text-align:right; }
+  #ammo { font-size:30px; font-weight:bold; line-height:1; }
+  #ammowrap .lbl { font-size:10px; opacity:0.6; }
+  #weapon { font-size:11px; color:var(--cyan); opacity:0.8; }
+  #scoreboard { top:10px; right:12px; text-align:right; font-size:12px; min-width:120px; }
+  #scoreboard .row { opacity:0.9; }
+  #scoreboard .me { color:var(--cyan); }
+  #killfeed { top:40px; right:12px; text-align:right; font-size:11px; }
+  #killfeed div { opacity:0.9; margin-top:2px; }
+  #status { top:26px; left:12px; font-size:11px; opacity:0.7; }
+  #dmgflash { position:absolute; inset:0; z-index:9; pointer-events:none;
+    background:radial-gradient(circle, transparent 40%, var(--hot) 130%); opacity:0; }
+
+  /* start / dead overlays */
+  #overlay { position:absolute; inset:0; z-index:20; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; text-align:center; gap:14px;
+    background:rgba(5,6,10,0.82); cursor:pointer; }
+  #overlay h1 { font-size:40px; letter-spacing:8px; color:var(--amber); }
+  #overlay .sub { font-size:13px; color:var(--cyan); opacity:0.85; max-width:440px; line-height:1.6; }
+  #overlay .go { font-size:14px; border:1px solid var(--amber); padding:10px 22px; margin-top:8px; }
+  #overlay .keys { font-size:11px; opacity:0.6; }
+  .hide { display:none !important; }
+</style>
+
+<div id="app">
+  <canvas id="screen" width="384" height="240"></canvas>
+  <div id="cross"></div>
+  <div id="dmgflash"></div>
+
+  <div class="hud" id="arena">STARFRAG · connecting…</div>
+  <div class="hud" id="status"></div>
+  <div class="hud" id="scoreboard"></div>
+  <div class="hud" id="killfeed"></div>
+
+  <div class="hud" id="hpwrap">
+    <div class="lbl">INTEGRITY</div>
+    <div id="hp">100</div>
+    <div id="hpbar"><i></i></div>
+  </div>
+  <div class="hud" id="ammowrap">
+    <div class="lbl">CELLS</div>
+    <div id="ammo">12</div>
+    <div id="weapon">PULSE CARBINE</div>
+  </div>
+
+  <div id="overlay">
+    <h1>STARFRAG</h1>
+    <div class="sub">A powered-but-abandoned starship, in orbit. The crew is gone.
+      You are not the only thing still moving on Deck 7.</div>
+    <div class="go">CLICK TO ENTER THE ARENA</div>
+    <div class="keys">WASD move · MOUSE look · CLICK fire · R reload · T report to BMO · M mark</div>
+  </div>
+</div>
+
+<script src="playtest-link.js"></script>
+<script type="module" src="js/game.js"></script>
