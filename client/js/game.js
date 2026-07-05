@@ -1,11 +1,13 @@
 // STARFRAG — client. A 2.5D raycaster arena FPS in one canvas.
 //
 // Rendering technique is adapted from the HULLROT raycaster (per-column DDA
-// walls, floor/ceiling casting, billboard sprites, a hand-drawn weapon
-// viewmodel) but simplified: walls/floors are procedurally shaded (no texture
-// banks yet — real sprite-forge art is a claimable feature). The map, the wire
-// protocol and the hitscan math all come from ../shared so client and server
-// agree exactly.
+// walls, floor/ceiling casting, billboard sprites, a POV weapon viewmodel).
+// Walls + floor sample real sprite-forge textures, the viewmodel is a keyed POV
+// carbine sprite and enemies are a chroma-keyed trooper billboard (see
+// assets/ART.md); the reactor emissive + starfield viewports stay procedural, and
+// every art path falls back to procedural shading until its asset loads. The map,
+// the wire protocol and the hitscan math all come from ../shared so client and
+// server agree exactly.
 import { WEAPONS, DEFAULT_WEAPON, C2S, S2C } from '../shared/protocol.js';
 import { compileMap, raycast, isSolidCell, TEX } from '../shared/map.js';
 import { Net } from './net.js';
@@ -79,6 +81,75 @@ function makeTrooper() {
 }
 const trooper = makeTrooper();
 
+// ---------------------------------------------------------------- assets (real art)
+// sprite-forge output wired in: sci-fi wall/floor textures, a POV pulse-carbine
+// viewmodel, and an enemy trooper billboard. Everything loads async and every draw
+// path falls back to the procedural version above until its asset is ready, so
+// liveness never depends on the network. Sprite magenta is removed with the forge
+// keyer (forge/animate.md): m = min(r,b) - g; m>52 -> transparent; 18<m<=52 ->
+// despill r,b -= (m-18)*0.8. Provenance: client/assets/ART.md.
+const ART_DIR = 'assets/art/';
+
+// Opaque power-of-two texture -> packed-RGBA Uint32Array we can sample per pixel.
+function loadWallTex(src, size = 256) {
+  const t = { px: null, size };
+  const im = new Image();
+  im.onload = () => {
+    const c = document.createElement('canvas'); c.width = size; c.height = size;
+    const g = c.getContext('2d'); g.imageSmoothingEnabled = true;
+    g.drawImage(im, 0, 0, size, size);
+    t.px = new Uint32Array(g.getImageData(0, 0, size, size).data.buffer);
+  };
+  im.onerror = () => console.warn('tex load failed:', src);
+  im.src = src;
+  return t;
+}
+
+// Chroma-key a magenta sprite, crop to its bounding box, hand back both a packed
+// Uint32Array (for the software billboard blitter) and a canvas (for ctx.drawImage).
+function loadSprite(src, cb) {
+  const im = new Image();
+  im.onload = () => {
+    const W = im.naturalWidth, H = im.naturalHeight;
+    const c = document.createElement('canvas'); c.width = W; c.height = H;
+    const g = c.getContext('2d'); g.drawImage(im, 0, 0);
+    const id = g.getImageData(0, 0, W, H), d = id.data;
+    let minX = W, minY = H, maxX = -1, maxY = -1;
+    for (let p = 0, i = 0; p < W * H; p++, i += 4) {
+      const r = d[i], gg = d[i + 1], b = d[i + 2];
+      const m = Math.min(r, b) - gg;
+      if (m > 52) { d[i + 3] = 0; continue; }
+      if (m > 18) { const k = (m - 18) * 0.8; d[i] = Math.max(0, r - k) | 0; d[i + 2] = Math.max(0, b - k) | 0; }
+      const x = p % W, y = (p / W) | 0;
+      if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y;
+    }
+    if (maxX < minX) { minX = 0; minY = 0; maxX = W - 1; maxY = H - 1; }
+    const bw = maxX - minX + 1, bh = maxY - minY + 1;
+    const cc = document.createElement('canvas'); cc.width = bw; cc.height = bh;
+    const gc = cc.getContext('2d');
+    const cid = gc.createImageData(bw, bh), cd = cid.data;
+    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+      const s = ((y + minY) * W + (x + minX)) * 4, o = (y * bw + x) * 4;
+      cd[o] = d[s]; cd[o + 1] = d[s + 1]; cd[o + 2] = d[s + 2]; cd[o + 3] = d[s + 3];
+    }
+    gc.putImageData(cid, 0, 0);
+    cb({ w: bw, h: bh, canvas: cc, px: new Uint32Array(cid.data.buffer) });
+  };
+  im.onerror = () => console.warn('sprite load failed:', src);
+  im.src = src;
+}
+
+const WALLTEX = {
+  [TEX.HULL]: loadWallTex(ART_DIR + 'wall_hull.png'),
+  [TEX.TECH]: loadWallTex(ART_DIR + 'wall_tech.png'),
+  [TEX.PANEL]: loadWallTex(ART_DIR + 'wall_panel.png'),
+  [TEX.PILLAR]: loadWallTex(ART_DIR + 'wall_hull.png'),
+};
+const deckTex = loadWallTex(ART_DIR + 'floor_deck.png');
+let trooperSprite = null, gunSprite = null;
+loadSprite(ART_DIR + 'trooper.png', (s) => { trooperSprite = s; });
+loadSprite(ART_DIR + 'carbine.png', (s) => { gunSprite = s; });
+
 // ---------------------------------------------------------------- sky / viewport
 // A pixel of the window-to-space: rotating planet + twinkling starfield, keyed
 // to view azimuth so turning pans it and walking never smears it.
@@ -137,13 +208,19 @@ function render(t) {
     const sx = (d * (rdx1 - rdx0)) / SCREEN_W, sy = (d * (rdy1 - rdy0)) / SCREEN_W;
     let fi = y * SCREEN_W;
     const ci = (2 * HORIZON - y) * SCREEN_W;
+    const dt = deckTex.px, dsz = deckTex.size, dmask = dsz - 1;
     for (let x = 0; x < SCREEN_W; x++, fi++) {
       const gx = fx - Math.floor(fx), gy = fy - Math.floor(fy);
       const seam = (gx < 0.045 || gy < 0.045);
-      // floor: dark steel plate, brighter grid seams
-      const fr = seam ? 78 : 52, fg = seam ? 82 : 55, fbl = seam ? 92 : 62;
-      fb[fi] = packRGB(fr * m | 0, fg * m | 0, fbl * m | 0);
-      // ceiling: darker, pipes
+      // floor: real deck-plate texture (one plate per world cell), fog-shaded
+      if (dt) {
+        const px = dt[(((gy * dsz) | 0) & dmask) * dsz + (((gx * dsz) | 0) & dmask)];
+        fb[fi] = packRGB((px & 255) * m | 0, ((px >> 8) & 255) * m | 0, ((px >> 16) & 255) * m | 0);
+      } else {
+        const fr = seam ? 78 : 52, fg = seam ? 82 : 55, fbl = seam ? 92 : 62;
+        fb[fi] = packRGB(fr * m | 0, fg * m | 0, fbl * m | 0);
+      }
+      // ceiling: darker, pipes (kept procedural — reads as unlit deckhead)
       if (ci >= 0) { const cm = m * 0.7; fb[ci + x] = packRGB((seam ? 40 : 22) * cm | 0, (seam ? 42 : 24) * cm | 0, (seam ? 50 : 30) * cm | 0); }
       fx += sx; fy += sy;
     }
@@ -172,20 +249,34 @@ function render(t) {
       continue;
     }
 
-    const base = WALLCOL[hit.tex] || WALLCOL[TEX.HULL];
     const side = hit.side === 1 ? 0.76 : 1;
     let m = fog(dist) * side;
     let er = 0, eg = 0, eb = 0;
     if (hit.tex === TEX.REACTOR) { const pulse = 0.7 + 0.3 * Math.sin(t * 4 + hit.mapX); m = Math.max(m, 0.55) * pulse + 0.25; er = 60 * pulse; eg = 26 * pulse; }
+    const tex = WALLTEX[hit.tex];
     let fi = cy0 * SCREEN_W + x;
-    for (let y = cy0; y < cy1; y++, fi += SCREEN_W) {
-      const v = (y - y0) / lineH;
-      let dm = 1;
-      if (v < 0.06 || v > 0.94) dm = 0.62;                 // top/bottom trim
-      else if (Math.abs(v - 0.5) < 0.015) dm = 0.82;        // mid seam
-      const fx = hit.texX * 2; if (fx - Math.floor(fx) < 0.05) dm *= 0.8; // vertical seam
-      const mm = m * dm;
-      fb[fi] = packRGB(Math.min(255, base[0] * mm + er) | 0, Math.min(255, base[1] * mm + eg) | 0, Math.min(255, base[2] * mm + eb) | 0);
+    if (tex && tex.px && hit.tex !== TEX.REACTOR) {
+      // textured wall: sample the sci-fi panel per column (texX) and per row (v)
+      const T = tex.size, mask = T - 1, tp = tex.px;
+      const tcol = ((hit.texX * T) | 0) & mask;
+      const tStep = T / lineH;
+      let tRow = (cy0 - y0) * tStep;
+      for (let y = cy0; y < cy1; y++, fi += SCREEN_W, tRow += tStep) {
+        const px = tp[(((tRow | 0) & mask) * T) + tcol];
+        fb[fi] = packRGB(Math.min(255, (px & 255) * m) | 0, Math.min(255, ((px >> 8) & 255) * m) | 0, Math.min(255, ((px >> 16) & 255) * m) | 0);
+      }
+    } else {
+      // procedural fallback (reactor emissive, or any texture not yet loaded)
+      const base = WALLCOL[hit.tex] || WALLCOL[TEX.HULL];
+      for (let y = cy0; y < cy1; y++, fi += SCREEN_W) {
+        const v = (y - y0) / lineH;
+        let dm = 1;
+        if (v < 0.06 || v > 0.94) dm = 0.62;                 // top/bottom trim
+        else if (Math.abs(v - 0.5) < 0.015) dm = 0.82;        // mid seam
+        const fx = hit.texX * 2; if (fx - Math.floor(fx) < 0.05) dm *= 0.8; // vertical seam
+        const mm = m * dm;
+        fb[fi] = packRGB(Math.min(255, base[0] * mm + er) | 0, Math.min(255, base[1] * mm + eg) | 0, Math.min(255, base[2] * mm + eb) | 0);
+      }
     }
   }
 
@@ -203,9 +294,12 @@ function render(t) {
   const nowMs = performance.now();
   for (const s of list) {
     const { p, tx, ty } = s;
+    // real trooper art when loaded (drawn full-colour); tinted procedural fallback
+    const spr = (trooperSprite && trooperSprite.px) ? trooperSprite : trooper;
+    const real = spr === trooperSprite;
     const screenX = (SCREEN_W / 2) * (1 + tx / ty);
     const hPx = (1.15 * PROJ) / ty;
-    const wPx = hPx * (trooper.w / trooper.h);
+    const wPx = hPx * (spr.w / spr.h);
     const floorY = HORIZON + (0.5 * PROJ) / ty;
     const yEnd = floorY, yStart = yEnd - hPx;
     const x0 = (screenX - wPx / 2) | 0, x1 = (screenX + wPx / 2) | 0;
@@ -214,17 +308,19 @@ function render(t) {
     const col = hexRGB(p.color);
     const cx0 = Math.max(0, x0), cx1 = Math.min(SCREEN_W, x1);
     const cyy0 = Math.max(0, yStart | 0), cyy1 = Math.min(SCREEN_H, yEnd | 0);
-    const stepTX = trooper.w / wPx, stepTY = trooper.h / hPx;
+    const stepTX = spr.w / wPx, stepTY = spr.h / hPx;
     for (let x = cx0; x < cx1; x++) {
       if (ty >= zbuf[x]) continue;
       const sxp = ((x - x0) * stepTX) | 0;
-      if (sxp < 0 || sxp >= trooper.w) continue;
+      if (sxp < 0 || sxp >= spr.w) continue;
       let tyf = (cyy0 - yStart) * stepTY, fi = cyy0 * SCREEN_W + x;
       for (let y = cyy0; y < cyy1; y++, fi += SCREEN_W, tyf += stepTY) {
-        const px = trooper.px[((tyf | 0) * trooper.w) + sxp];
+        const px = spr.px[((tyf | 0) * spr.w) + sxp];
         if ((px >>> 24) < 110) continue;
         const r = (px & 255), g = (px >> 8) & 255, b = (px >> 16) & 255;
-        fb[fi] = packRGB((r * col[0] / 255 * m) | 0, (g * col[1] / 255 * m) | 0, (b * col[2] / 255 * m) | 0);
+        fb[fi] = real
+          ? packRGB((r * m) | 0, (g * m) | 0, (b * m) | 0)
+          : packRGB((r * col[0] / 255 * m) | 0, (g * col[1] / 255 * m) | 0, (b * col[2] / 255 * m) | 0);
       }
     }
     // health bar
@@ -267,25 +363,35 @@ function drawGun(ctx, t) {
   const cx = SCREEN_W / 2 + bx + cam.kickX * 0.4;
   const baseY = SCREEN_H + kick + dip + by + cam.kickY * 0.3;
 
+  let muzzleY = baseY - 120;   // procedural fallback muzzle height
   ctx.save();
   ctx.translate(cx, baseY);
   ctx.rotate(roll);
-  // stock / receiver
-  ctx.fillStyle = '#20242c'; ctx.fillRect(-34, -46, 68, 60);
-  ctx.fillStyle = '#2c323c'; ctx.fillRect(-30, -70, 60, 30);
-  ctx.fillStyle = '#171a20'; ctx.fillRect(-12, -118, 24, 60);   // barrel/receiver up to muzzle
-  ctx.fillStyle = '#3a4450'; ctx.fillRect(-8, -116, 16, 10);    // barrel shroud band
-  // energy cell (glowing)
-  ctx.fillStyle = '#0a3a44'; ctx.fillRect(-26, -40, 10, 34);
-  ctx.fillStyle = me.clip > 0 ? '#3cd6ff' : '#ff3c4a';
-  ctx.fillRect(-24, -38 + 30 * (1 - me.clip / wp.clip), 6, 30 * (me.clip / wp.clip) + 1);
-  // sight
-  ctx.fillStyle = '#3a4450'; ctx.fillRect(-3, -128, 6, 12);
+  if (gunSprite) {
+    // real POV pulse carbine (sprite-forge / gpt-image-2), anchored bottom-centre
+    const gw = SCREEN_W * 0.7;
+    const gh = gw * (gunSprite.h / gunSprite.w);
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(gunSprite.canvas, -gw / 2, -gh, gw, gh);
+    muzzleY = baseY - gh * 0.96;   // flash at the foreshortened barrel tip
+  } else {
+    // procedural fallback (draws until the sprite loads)
+    ctx.fillStyle = '#20242c'; ctx.fillRect(-34, -46, 68, 60);
+    ctx.fillStyle = '#2c323c'; ctx.fillRect(-30, -70, 60, 30);
+    ctx.fillStyle = '#171a20'; ctx.fillRect(-12, -118, 24, 60);   // barrel/receiver up to muzzle
+    ctx.fillStyle = '#3a4450'; ctx.fillRect(-8, -116, 16, 10);    // barrel shroud band
+    // energy cell (glowing)
+    ctx.fillStyle = '#0a3a44'; ctx.fillRect(-26, -40, 10, 34);
+    ctx.fillStyle = me.clip > 0 ? '#3cd6ff' : '#ff3c4a';
+    ctx.fillRect(-24, -38 + 30 * (1 - me.clip / wp.clip), 6, 30 * (me.clip / wp.clip) + 1);
+    // sight
+    ctx.fillStyle = '#3a4450'; ctx.fillRect(-3, -128, 6, 12);
+  }
   ctx.restore();
 
-  // muzzle flash
+  // muzzle flash — separate additive overlay, fired via vm.flash (never baked in)
   if (vm.flash > 0.35) {
-    const mx = cx, my = baseY - 120;
+    const mx = cx, my = muzzleY;
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
     ctx.translate(mx, my);

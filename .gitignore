@@ -3,6 +3,7 @@ node_modules/
 npm-debug.log*
 .DS_Store
 playtest-inbox/
+scratch-art/
 client/assets/sfx/*.mp3
 !client/assets/sfx/.gitkeep
 .env
