@@ -21,7 +21,7 @@ freely. Status: `open` · `claimed` · `in progress` · `done`. See
 
 | feature                              | owner   | status |
 |--------------------------------------|---------|--------|
-| Railgun (slow, high-dmg, piercing)   | _open_  | open   |
+| Railgun (slow, high-dmg, piercing)   | tinyclaw | claimed |
 | Plasma repeater (projectile, splash) | _open_  | open   |
 | Riot scattergun (pellets, close)     | _open_  | open   |
 | Weapon switching + pickups on map    | _open_  | open   |
