@@ -53,11 +53,103 @@ const me = {
   clip: WEAPONS[DEFAULT_WEAPON].clip, fireT: -1e9, reloadUntil: 0, wasReloading: false,
   dead: false, weapon: DEFAULT_WEAPON, id: null,
 };
-const cam = { kickY: 0, kickX: 0, roll: 0, dmgFlash: 0 };
+const cam = { kickY: 0, kickX: 0, roll: 0, dmgFlash: 0, shake: 0, hitstop: 0 };
 const vm = { flash: 0, kick: 0 };            // viewmodel fx
+// reactive crosshair: bloom grows with recoil/movement + tightens when still;
+// hit/kill are hit-marker pips that pop on a confirmed landed shot (server truth).
+const cross = { bloom: 0, hit: 0, kill: 0 };
 let started = IS_BOT;                          // bots skip the click-to-start gate
 const flashUntil = new Map();                 // playerId -> ms, remote muzzle flash
 const killfeed = [];                          // { text, until }
+
+// ---------------------------------------------------------------- combat feel: particles + bolts
+// COMBAT-FEEL PASS (technique adapted from HULLROT's feel layer, sxs-doom/h-feel).
+// Two client-side world-space systems, both PURELY COSMETIC — the server still
+// owns every damage/kill decision (see resolveShot); the client only reacts to
+// S2C.HIT / S2C.KILL / S2C.SHOT to paint what already happened.
+//
+//   particles[] — blood & sparks with (x,y,z) gravity; blood SETTLES into a
+//                 persistent floor splat, so a fought-over spot stays painted.
+//   bolts[]     — plasma projectiles that TRAVEL: spawned on every shot (mine +
+//                 remotes, from S2C.SHOT), advance each frame, stop on a wall
+//                 (spark + impact sfx). v1 IS CLIENT-VISUAL — damage is still the
+//                 server's instant hitscan, so a bolt you dodge on screen may have
+//                 already registered. Server-authoritative travel is the follow-up
+//                 (spawn/advance/collide the bolt on server.mjs, damage on arrival).
+const MAX_PARTICLES = 260, MAX_SPLATS = 140, MAX_BOLTS = 48;
+let particles = [];   // { x,y,z, dx,dy,dz, life, r,g,b, size, settle }
+let splats = [];      // settled gore: { x,y, r,g,b, size } — persistent, FIFO-capped
+let bolts = [];       // { x,y, dx,dy, life, r,g,b, own }
+
+function spawnBurst(x, y, z, n, opts = {}) {
+  if (IS_BOT) return;   // headless bot clients don't need the gore — save the box's CPU
+  const { dirX = 0, dirY = 0, spread = 1, speed = 2.4, up = 1.5,
+    r = 176, g = 20, b = 14, size = 1.5, settle = true, life = 1.1 } = opts;
+  for (let i = 0; i < n; i++) {
+    if (particles.length >= MAX_PARTICLES) break;
+    const a = Math.random() * 2 * Math.PI;
+    const sp = (0.3 + Math.random() * 0.7) * speed;
+    const kR = 0.72 + Math.random() * 0.5;
+    particles.push({
+      x, y, z: z + (Math.random() - 0.5) * 0.12,
+      dx: dirX * sp * 0.8 + Math.cos(a) * sp * spread * 0.45,
+      dy: dirY * sp * 0.8 + Math.sin(a) * sp * spread * 0.45,
+      dz: (Math.random() * 0.9 + 0.25) * up,
+      life: life * (0.6 + Math.random() * 0.7),
+      r: Math.min(255, r * kR) | 0, g: Math.min(255, g * kR) | 0, b: Math.min(255, b * kR) | 0,
+      size: size * (0.7 + Math.random() * 0.7),
+      settle,
+    });
+  }
+}
+function tickParticles(dt) {
+  for (const p of particles) {
+    p.life -= dt;
+    p.x += p.dx * dt; p.y += p.dy * dt;
+    p.dz -= 5.4 * dt;                    // gravity (z: 0 floor .. 1 ceiling-ish)
+    p.z += p.dz * dt;
+    if (isSolidCell(world.grid, world.W, world.H, p.x | 0, p.y | 0)) { p.life = 0; continue; }
+    if (p.z <= 0.02) {                   // hits the deck
+      if (p.settle) {
+        splats.push({ x: p.x, y: p.y, r: (p.r * 0.5) | 0, g: (p.g * 0.5) | 0, b: (p.b * 0.5) | 0, size: p.size * 1.5 });
+        if (splats.length > MAX_SPLATS) splats.shift();
+      }
+      p.life = 0;
+    }
+  }
+  if (particles.length) particles = particles.filter((p) => p.life > 0);
+}
+
+// One traveling plasma bolt. `own` bolts (mine) glow cyan; incoming glow hot.
+function spawnBolt(x, y, ang, own) {
+  if (IS_BOT) return;
+  if (bolts.length >= MAX_BOLTS) bolts.shift();
+  const BOLT_SPEED = 30;                            // world-units/sec — fast plasma, still visibly travels
+  bolts.push({
+    x: x + Math.cos(ang) * 0.35, y: y + Math.sin(ang) * 0.35,
+    dx: Math.cos(ang) * BOLT_SPEED, dy: Math.sin(ang) * BOLT_SPEED,
+    life: 1.4, own,
+    r: own ? 120 : 255, g: own ? 235 : 150, b: own ? 255 : 90,
+  });
+}
+function tickBolts(dt) {
+  for (const b of bolts) {
+    b.life -= dt;
+    const nx = b.x + b.dx * dt, ny = b.y + b.dy * dt;
+    if (isSolidCell(world.grid, world.W, world.H, nx | 0, ny | 0)) {
+      // slammed into a wall: spark puff + impact ping, then die
+      const inv = 1 / Math.hypot(b.dx, b.dy);
+      spawnBurst(b.x, b.y, 0.5, 7, {
+        dirX: -b.dx * inv, dirY: -b.dy * inv, speed: 2.0, up: 1.1, spread: 1.2,
+        r: 255, g: 210, b: 120, size: 1.1, settle: false, life: 0.35,
+      });
+      if (b.own) playSfx('impact', 0.4);
+      b.life = 0; continue;
+    }
+    b.x = nx; b.y = ny;
+  }
+  if (bolts.length) bolts = bolts.filter((b) => b.life > 0);
+}
 
 // ---------------------------------------------------------------- assets (procedural)
 // One neutral-gray trooper sprite, tinted per player at draw time.
@@ -354,6 +446,67 @@ function render(t) {
     }
   }
 
+  // --- combat feel: splats (floor), blood/spark particles, plasma bolts ---
+  // World-space billboards projected with the same camera basis as the sprites
+  // above, depth-tested against the wall zbuf so gore hides behind cover.
+  // opaque flat point (blood particle / floor splat)
+  function drawPoint(wx, wy, z, size, pr, pg, pb) {
+    const relX = wx - me.x, relY = wy - me.y;
+    const ptx = invDet * (dirY * relX - dirX * relY);
+    const pty = invDet * (-planeY * relX + planeX * relY);
+    if (pty <= 0.2 || pty > 40) return;
+    const sx = ((SCREEN_W / 2) * (1 + ptx / pty)) | 0;
+    if (sx < 0 || sx >= SCREEN_W || pty >= zbuf[sx]) return;
+    const sy = (HORIZON + ((0.5 - z) * PROJ) / pty) | 0;
+    let m = fog(pty); if (m < 0.35) m = 0.35;
+    const r = Math.min(255, pr * m) | 0, g = Math.min(255, pg * m) | 0, b = Math.min(255, pb * m) | 0;
+    const col = packRGB(r, g, b);
+    let w2 = (size * PROJ * 0.012) / pty; if (w2 < 1) w2 = 1; if (w2 > 9) w2 = 9;
+    const h2 = z <= 0.02 ? Math.max(1, w2 * 0.4) : w2;   // floor splats lie flat
+    const x0p = (sx - w2 / 2) | 0, y0p = (sy - h2 / 2) | 0;
+    for (let yy = y0p; yy < y0p + h2; yy++) {
+      if (yy < 0 || yy >= SCREEN_H) continue;
+      for (let xx = Math.max(0, x0p); xx < Math.min(SCREEN_W, x0p + w2); xx++) {
+        if (pty >= zbuf[xx]) continue;
+        fb[yy * SCREEN_W + xx] = col;
+      }
+    }
+  }
+  // additive glowing plasma bolt with a bright core + falloff halo
+  function drawBolt(b) {
+    const relX = b.x - me.x, relY = b.y - me.y;
+    const ptx = invDet * (dirY * relX - dirX * relY);
+    const pty = invDet * (-planeY * relX + planeX * relY);
+    if (pty <= 0.2 || pty > 40) return;
+    const sx = ((SCREEN_W / 2) * (1 + ptx / pty)) | 0;
+    const sy = (HORIZON + (0.5 * PROJ) / pty - (0.05 * PROJ) / pty) | 0;   // chest height
+    let rad = (0.42 * PROJ) / pty; if (rad < 1.5) rad = 1.5; if (rad > 22) rad = 22;
+    const x0 = Math.max(0, (sx - rad) | 0), x1 = Math.min(SCREEN_W - 1, (sx + rad) | 0);
+    const y0 = Math.max(0, (sy - rad) | 0), y1 = Math.min(SCREEN_H - 1, (sy + rad) | 0);
+    const r2 = rad * rad;
+    for (let yy = y0; yy <= y1; yy++) {
+      for (let xx = x0; xx <= x1; xx++) {
+        if (pty >= zbuf[xx]) continue;                 // behind a wall
+        const dxp = xx - sx, dyp = yy - sy, d2 = dxp * dxp + dyp * dyp;
+        if (d2 > r2) continue;
+        const f = 1 - d2 / r2;                          // 0..1 radial falloff
+        const glow = f * f;
+        const core = d2 < 2.2 ? 1 : 0;                  // hot white centre
+        const ar = Math.min(255, b.r * glow + core * 200) | 0;
+        const ag = Math.min(255, b.g * glow + core * 200) | 0;
+        const ab = Math.min(255, b.b * glow + core * 200) | 0;
+        const i = yy * SCREEN_W + xx, px = fb[i];
+        const nr = Math.min(255, (px & 255) + ar);
+        const ng = Math.min(255, ((px >> 8) & 255) + ag);
+        const nb = Math.min(255, ((px >> 16) & 255) + ab);
+        fb[i] = packRGB(nr, ng, nb);
+      }
+    }
+  }
+  for (const sp of splats) drawPoint(sp.x, sp.y, 0.006, sp.size, sp.r, sp.g, sp.b);
+  for (const p of particles) drawPoint(p.x, p.y, Math.max(0.02, p.z), p.size, p.r, p.g, p.b);
+  for (const b of bolts) drawBolt(b);
+
   octx.putImageData(img, 0, 0);
 }
 
@@ -437,8 +590,16 @@ function fire() {
   if (me.dead || nowMs - me.fireT < wp.rateMs || nowMs < me.reloadUntil) return;
   if (me.clip <= 0) { startReload(); return; }
   me.clip--; me.fireT = nowMs;
-  vm.flash = 1; vm.kick = 1; cam.kickY += 4;
+  // punchy recoil: viewmodel snap + view kicks up-and-slightly-sideways + a
+  // touch of roll, and the crosshair blooms open (tightens back as it decays).
+  vm.flash = 1; vm.kick = 1;
+  cam.kickY += 5.5;
+  cam.kickX += (Math.random() - 0.5) * 3.2;
+  cam.roll += (Math.random() - 0.5) * 0.016;
+  cross.bloom = Math.min(1.4, cross.bloom + 0.9);
+  spawnBolt(me.x, me.y, me.ang, true);       // my plasma bolt (client-visual v1)
   playSfx('shoot');
+  playSfx('whoosh', 0.22);                     // plasma launch layer, under the report
   Net.shoot(me.ang, me.weapon);
   window.PlaytestLink && PlaytestLink.event('shot', { clip: me.clip, weapon: me.weapon });
 }
@@ -459,13 +620,13 @@ function startReload() {
 const SFX_DIR = 'assets/sfx/';
 const sfxTemplates = {};
 let audioUnlocked = false; // set on the human's first gesture; bots stay silent
-function playSfx(name) {
+function playSfx(name, vol = 0.5) {
   if (!audioUnlocked) return;
   try {
     let base = sfxTemplates[name];
-    if (!base) { base = sfxTemplates[name] = new Audio(SFX_DIR + name + '.mp3'); base.volume = 0.5; }
+    if (!base) { base = sfxTemplates[name] = new Audio(SFX_DIR + name + '.mp3'); }
     const node = base.cloneNode();     // clone so overlapping shots don't cut each other
-    node.volume = base.volume;
+    node.volume = Math.max(0, Math.min(1, vol));
     node.play().catch(() => {});       // missing file / not-yet-generated -> silent
   } catch {}
 }
@@ -475,15 +636,58 @@ Net.onWelcome = (m) => {
   me.id = m.id; me.x = m.spawn.x; me.y = m.spawn.y; me.ang = m.spawn.ang;
   document.getElementById('arena').textContent = 'STARFRAG · ' + m.mapName;
 };
-Net.on(S2C.SHOT, (m) => { if (m.id !== me.id) flashUntil.set(m.id, performance.now() + 90); });
+Net.on(S2C.SHOT, (m) => {
+  if (m.id === me.id) return;                 // my own bolt is spawned locally in fire()
+  flashUntil.set(m.id, performance.now() + 90);
+  // a plasma bolt travels from the enemy along their shot vector — you SEE it come
+  const sh = Net.players.get(m.id);
+  if (sh && Number.isFinite(m.ang)) spawnBolt(sh.x, sh.y, m.ang, false);
+});
 Net.on(S2C.HIT, (m) => {
-  if (m.id === me.id) { cam.dmgFlash = 1; cam.kickY += 6; playSfx('hurt'); window.PlaytestLink && PlaytestLink.event('player_hit', { dmg: m.dmg, hp: m.hp }); }
+  // I took damage — punchy vignette + a flinch AWAY from the shooter's direction
+  if (m.id === me.id) {
+    cam.dmgFlash = Math.min(1, cam.dmgFlash + 0.6);
+    cam.shake += 3.2;
+    const sh = Net.players.get(m.by);
+    if (sh) {
+      let rel = Math.atan2(sh.y - me.y, sh.x - me.x) - me.ang;
+      rel -= Math.round(rel / (2 * Math.PI)) * 2 * Math.PI;
+      const side = Math.sin(rel);
+      cam.kickX += -side * 7; cam.roll += -side * 0.05; cam.kickY += Math.abs(Math.cos(rel)) * 3.5;
+    } else cam.kickY += 6;
+    playSfx('hurt');
+    window.PlaytestLink && PlaytestLink.event('player_hit', { dmg: m.dmg, hp: m.hp });
+  }
+  // MY shot landed on someone (server confirmed) — hit-marker + blood at the wound
+  if (m.by === me.id && m.id !== me.id) {
+    const isKill = m.hp <= 0;
+    cross.hit = 1;
+    if (!isKill) playSfx('hitmarker', 0.5);   // the kill sound covers the killing blow
+    const v = Net.players.get(m.id);
+    if (v) {
+      let dx = v.x - me.x, dy = v.y - me.y; const L = Math.hypot(dx, dy) || 1; dx /= L; dy /= L;
+      spawnBurst(v.x - dx * 0.15, v.y - dy * 0.15, 0.42, isKill ? 4 : 10, {
+        dirX: dx, dirY: dy, speed: 2.6, up: 1.5, size: 1.5,
+      });
+    }
+  }
 });
 Net.on(S2C.KILL, (m) => {
   const nm = m.names || {};
   killfeed.push({ text: `${nm.by || m.by} ⟶ ${nm.id || m.id}`, until: performance.now() + 6000 });
   if (killfeed.length > 5) killfeed.shift();
-  if (m.by === me.id) window.PlaytestLink && PlaytestLink.event('kill', { victim: m.id });
+  // I got the frag — kill-marker, a heavier hitstop punch + gib burst
+  if (m.by === me.id && m.id !== me.id) {
+    cross.hit = 1; cross.kill = 1;
+    cam.hitstop = 0.05; cam.kickY += 4; cam.shake += 2.2;
+    playSfx('killconfirm', 0.6);
+    const v = Net.players.get(m.id);
+    if (v) {
+      spawnBurst(v.x, v.y, 0.4, 22, { speed: 3.4, up: 2.2, spread: 1.3, size: 2.2, life: 1.4 });
+      spawnBurst(v.x, v.y, 0.5, 8, { speed: 1.6, up: 2.6, size: 3.0, life: 1.7, r: 130, g: 12, b: 10 });
+    }
+    window.PlaytestLink && PlaytestLink.event('kill', { victim: m.id });
+  }
   if (m.id === me.id) { playSfx('death'); window.PlaytestLink && PlaytestLink.event('death', { by: m.by }); }
 });
 Net.on(S2C.SPAWN, (m) => {
@@ -545,45 +749,99 @@ function frame(now) {
   // reload completion
   if (me.wasReloading && performance.now() >= me.reloadUntil) { me.clip = WEAPONS[me.weapon].clip; me.wasReloading = false; }
 
-  // movement intent
-  let f = 0, s = 0;
-  if (IS_BOT) { botThink(dt); const mv = me._botMove(); f = mv.f; s = mv.s; if (me.clip <= 0) startReload(); }
-  else if (started && !me.dead) {
-    if (keys.KeyW || keys.ArrowUp) f += 1;
-    if (keys.KeyS || keys.ArrowDown) f -= 1;
-    if (keys.KeyA) s -= 1;
-    if (keys.KeyD) s += 1;
-    if (keys.ArrowLeft) me.ang -= 2.4 * dt;
-    if (keys.ArrowRight) me.ang += 2.4 * dt;
-    if (fireHeld) fire();
-  }
-  if (!me.dead) {
-    const len = Math.hypot(f, s); if (len > 1) { f /= len; s /= len; }
-    const SPEED = 3.4;
-    const dirX = Math.cos(me.ang), dirY = Math.sin(me.ang);
-    moveMe((dirX * f - dirY * s) * SPEED * dt, (dirY * f + dirX * s) * SPEED * dt);
-    me.moving += ((len > 0.1 ? 1 : 0) - me.moving) * Math.min(1, dt * 10);
-    if (len > 0.1) me.bobPhase += dt * 8.5;
-    me.strafeLean += (s - me.strafeLean) * Math.min(1, dt * 6);
+  // KILL HITSTOP: for one beat the local sim holds its breath so a frag lands
+  // with weight. Networking + rendering keep running; only input/movement/decay
+  // pause (~50ms), and it's disabled for headless bots. This just skips a couple
+  // of local frames — the server clock is untouched, so it's netcode-safe.
+  const frozen = !IS_BOT && cam.hitstop > 0;
+  if (frozen) cam.hitstop -= dt;
+
+  if (!frozen) {
+    // movement intent
+    let f = 0, s = 0;
+    if (IS_BOT) { botThink(dt); const mv = me._botMove(); f = mv.f; s = mv.s; if (me.clip <= 0) startReload(); }
+    else if (started && !me.dead) {
+      if (keys.KeyW || keys.ArrowUp) f += 1;
+      if (keys.KeyS || keys.ArrowDown) f -= 1;
+      if (keys.KeyA) s -= 1;
+      if (keys.KeyD) s += 1;
+      if (keys.ArrowLeft) me.ang -= 2.4 * dt;
+      if (keys.ArrowRight) me.ang += 2.4 * dt;
+      if (fireHeld) fire();
+    }
+    if (!me.dead) {
+      const len = Math.hypot(f, s); if (len > 1) { f /= len; s /= len; }
+      const SPEED = 3.4;
+      const dirX = Math.cos(me.ang), dirY = Math.sin(me.ang);
+      moveMe((dirX * f - dirY * s) * SPEED * dt, (dirY * f + dirX * s) * SPEED * dt);
+      me.moving += ((len > 0.1 ? 1 : 0) - me.moving) * Math.min(1, dt * 10);
+      if (len > 0.1) me.bobPhase += dt * 8.5;
+      me.strafeLean += (s - me.strafeLean) * Math.min(1, dt * 6);
+    }
+
+    // combat feel: advance gore + traveling bolts
+    tickParticles(dt);
+    tickBolts(dt);
+
+    // decay fx (springs)
+    vm.flash = Math.max(0, vm.flash - dt * 8);
+    vm.kick = Math.max(0, vm.kick - dt * 6);
+    cam.kickY *= Math.max(0, 1 - dt * 9);
+    cam.kickX *= Math.max(0, 1 - dt * 9);
+    cam.roll *= Math.max(0, 1 - dt * 7);
+    cam.shake = Math.max(0, cam.shake - dt * 22);
+    cam.dmgFlash = Math.max(0, cam.dmgFlash - dt * 1.6);
+    cross.bloom = Math.max(0, cross.bloom - dt * 4);      // crosshair tightens back
+    cross.hit = Math.max(0, cross.hit - dt * 3.2);
+    cross.kill = Math.max(0, cross.kill - dt * 2.5);
   }
 
-  // decay fx
-  vm.flash = Math.max(0, vm.flash - dt * 8);
-  vm.kick = Math.max(0, vm.kick - dt * 6);
-  cam.kickY *= Math.max(0, 1 - dt * 9);
-  cam.kickX *= Math.max(0, 1 - dt * 9);
-  cam.dmgFlash = Math.max(0, cam.dmgFlash - dt * 1.6);
-
-  // send position to server ~20Hz
+  // send position to server ~20Hz (never gated — keep the connection warm)
   netAcc += dt;
   if (netAcc >= 0.05) { netAcc = 0; if (Net.connected) Net.move(+me.x.toFixed(3), +me.y.toFixed(3), +me.ang.toFixed(3), me.moving > 0.2 ? 1 : 0); }
 
-  // draw
+  // draw — composite the world with camera kick, roll and a hit-shake jitter
   render(t);
+  const shx = cam.shake ? (Math.random() - 0.5) * cam.shake : 0;
+  const shy = cam.shake ? (Math.random() - 0.5) * cam.shake : 0;
+  sctx.save();
   sctx.fillStyle = '#05060a'; sctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
-  sctx.drawImage(off, cam.kickX * 0.3, cam.kickY * 0.3);
+  sctx.translate(SCREEN_W / 2, SCREEN_H / 2);
+  sctx.rotate(cam.roll);
+  const over = 1 + Math.abs(cam.roll) * 1.6;      // scale up to hide corners the roll exposes
+  sctx.scale(over, over);
+  sctx.drawImage(off, -SCREEN_W / 2 + cam.kickX * 0.3 + shx, -SCREEN_H / 2 + cam.kickY * 0.3 + shy);
+  sctx.restore();
   if (!me.dead) drawGun(sctx, t);
+  if (!me.dead && !IS_BOT) drawCrosshair(sctx);
   updateHUD();
+}
+
+// reactive crosshair + hit-marker, drawn straight on the display canvas so it
+// blooms with recoil/movement and confirms landed shots (white pip; red on a kill).
+function drawCrosshair(ctx) {
+  const cx = SCREEN_W / 2, cy = HORIZON;
+  const gap = 2.5 + cross.bloom * 6 + me.moving * 2.5, len = 3.5, th = 1;
+  ctx.save();
+  ctx.fillStyle = 'rgba(60,214,255,0.9)';
+  ctx.fillRect(cx - th / 2, cy - gap - len, th, len);
+  ctx.fillRect(cx - th / 2, cy + gap, th, len);
+  ctx.fillRect(cx - gap - len, cy - th / 2, len, th);
+  ctx.fillRect(cx + gap, cy - th / 2, len, th);
+  ctx.fillRect(cx - 0.5, cy - 0.5, 1, 1);
+  if (cross.hit > 0) {
+    const k = Math.min(1, cross.hit), hr = 4 + (1 - k) * 5, hl = 4;
+    ctx.globalAlpha = k;
+    ctx.strokeStyle = cross.kill > 0 ? 'rgba(255,70,80,1)' : 'rgba(255,255,255,1)';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    for (const [sx, sy] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+      ctx.moveTo(cx + sx * hr, cy + sy * hr);
+      ctx.lineTo(cx + sx * (hr + hl), cy + sy * (hr + hl));
+    }
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
 // ---------------------------------------------------------------- HUD
@@ -609,6 +867,11 @@ function updateHUD() {
 }
 
 // ---------------------------------------------------------------- boot
+// the reactive crosshair + hit-marker are drawn on the canvas now — retire the
+// static DOM one so they don't double up.
+const _domCross = document.getElementById('cross');
+if (_domCross) _domCross.style.display = 'none';
+
 Net.connect(MY_NAME);
 
 // __game hook (playtest-link AGENT-INSTRUCTIONS bar 7) + QA teleport
@@ -624,6 +887,7 @@ window.__game = {
   get id() { return me.id; },
   get connected() { return Net.connected; },
   snapshot() { return [...Net.players.values()]; }, // authoritative view of all players
+  counts() { return { particles: particles.length, splats: splats.length, bolts: bolts.length }; }, // QA: feel-fx liveness
   teleport(x, y, ang) { me.x = x; me.y = y; if (ang !== undefined) me.ang = ang; },
   setPos(x, y, ang) { this.teleport(x, y, ang); },
   fire() { me.fireT = -1e9; fire(); },

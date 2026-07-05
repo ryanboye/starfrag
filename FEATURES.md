@@ -16,6 +16,10 @@ freely. Status: `open` · `claimed` · `in progress` · `done`. See
 | bot mode (`?bot=1`) + `bot.mjs` + service  | BMO   | done   |
 | playtest-link integration (T to report)    | BMO   | done   |
 | map-as-named-data + shared compile         | BMO   | done   |
+| combat feel: blood/gibs, sparks, hit-marker | BMO  | done   |
+| combat feel: screen-kick, roll, kill-hitstop| BMO  | done   |
+| reactive crosshair (blooms/tightens)        | BMO  | done   |
+| plasma bolts that travel (client-visual v1) | BMO  | done   |
 
 ## Open slots — weapons
 
@@ -44,7 +48,8 @@ freely. Status: `open` · `claimed` · `in progress` · `done`. See
 | Match timer + round win + intermission     | _open_ | open   |
 | Remote-player interpolation (smooth motion)| _open_ | open   |
 | Armor as a damage-absorbing stat           | _open_ | open   |
-| Damage numbers / hitmarkers                | _open_ | open   |
+| Damage numbers (hit-markers ✅ shipped)     | _open_ | open   |
+| **Server-authoritative projectile travel** (bolts are client-visual v1 today — hits are still instant server hitscan; move spawn/advance/collide+damage onto server.mjs so bolts can be *really* dodged) | _open_ | open |
 
 ## Open slots — art / audio / set dressing
 
