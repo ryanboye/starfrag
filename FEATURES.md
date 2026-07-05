@@ -35,7 +35,7 @@ freely. Status: `open` · `claimed` · `in progress` · `done`. See
 | feature                                        | owner   | status |
 |------------------------------------------------|---------|--------|
 | Engineering deck (reactor hazard, catwalks)    | _open_  | open   |
-| Hangar bay (huge viewport, open sightlines)    | seb     | in progress |
+| Hangar bay (huge viewport, open sightlines)    | seb     | done ✅ |
 | Cryo-quarters (tight corridors, ambush maze)   | _open_  | open   |
 | Map rotation / voting between rounds           | _open_  | open   |
 
@@ -50,6 +50,7 @@ freely. Status: `open` · `claimed` · `in progress` · `done`. See
 | Armor as a damage-absorbing stat           | _open_ | open   |
 | Damage numbers (hit-markers ✅ shipped)     | _open_ | open   |
 | **Server-authoritative projectile travel** (bolts are client-visual v1 today — hits are still instant server hitscan; move spawn/advance/collide+damage onto server.mjs so bolts can be *really* dodged) | _open_ | open |
+| Airlock objective — arm 4 consoles, open bay-door, vent enemies out to win | seb | claimed |
 
 ## Open slots — art / audio / set dressing
 
