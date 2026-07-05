@@ -56,7 +56,7 @@ freely. Status: `open` · `claimed` · `in progress` · `done`. See
 | feature                                      | owner   | status |
 |----------------------------------------------|---------|--------|
 | Real wall/floor textures (sprite-forge)      | BMO     | done ✅ |
-| 8-way directional enemy player sprites       | BMO     | queued (sprite-forge, next) |
+| 8-way directional enemy player sprites       | BMO     | in progress |
 | Weapon viewmodel art (carbine)               | BMO     | done ✅ (reload anim next) |
 | SFX pack (shoot/reload/hurt/death/spawn)     | BMO     | done ✅ |
 | Ambient ship hum / klaxon / music            | _open_  | open   |
