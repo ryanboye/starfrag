@@ -255,9 +255,11 @@ const DIR8_FILES = ['trooper.png', 'trooper_se.png', 'trooper_e.png', 'trooper_n
                     'trooper_n.png', 'trooper_nw.png', 'trooper_w.png', 'trooper_sw.png'];
 const trooperDir = new Array(8).fill(null);
 DIR8_FILES.forEach((f, i) => loadSprite(ART_DIR + f, (s) => { trooperDir[i] = s; }));
-// Flip to -1 if a strafing enemy shows the wrong side (mirrors the two side-arcs;
-// the front/back anchors are unaffected). Verified by screenshot at wire-in time.
-const DIR8_HANDED = 1;
+// -1 because the world is y-down (left-handed): a west-facing enemy must read as
+// facing screen-left. This mirrors the two side-arcs (front/back anchors are fixed).
+// Verified by screenshot (tools/verify-dir8.mjs): the sign that makes a strafing
+// enemy show the correct side and the on-screen facing match its world yaw.
+const DIR8_HANDED = -1;
 // Pick the directional sprite for enemy p as seen from the viewer at (me.x,me.y).
 // rel = enemyYaw - angle(enemy->viewer): 0 => they face us (front/S), π => their
 // back (N), ±π/2 => a side. Quantize to 8 buckets; fall back while art loads.
