@@ -36,6 +36,15 @@ end to end, for each animation.
 | RIOT SCATTERGUN | ✅ | ✅ 5-frame (flash → brass shell eject → smoke → settle) | ✅ 8-frame pump-action (grip → rack → chamber → return) |
 | PLASMA REPEATER | ✅ | bolt + green flash (fast 165 ms cadence — a frame strip would flicker) | ✅ 8-frame energy-cell swap → coil recharge arc |
 | PULSE CARBINE | ✅ (existing) | muzzle flash overlay | procedural dip |
+| RAILGUN | ✅ | ✅ 5-frame (discharge flash → recoil kick → settle to idle) | ✅ 8-frame (rack breech → glowing rail-slug in → slam → idle; first=last idle) |
+
+**RAILGUN adds a new CHARGE state** the other guns don't have: an **8-frame ramp
+indexed 0→1 by charge progress** (`railgun/charge/f0..f7`, f0 = idle/dark, f7 =
+fully charged — coils spin up, arcs crawl the rails, muzzle builds to a white-hot
+point; no beam leaves the barrel). Receipted in `railgun-1..14` (hero →
+charge/fire/reload each: extract → pick → repair → in-game keyed). Prompts are
+tinyclaw's verbatim text in `docs/railgun-art-prompts.md`. Art lands on branch
+`art/railgun`; tinyclaw wires the code.
 
 The **final, keyed, in-game frames** are the committed game assets under
 `client/assets/art/scatter/**` and `client/assets/art/plasma/**`. The **full-res raw
