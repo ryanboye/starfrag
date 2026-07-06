@@ -25,7 +25,7 @@ freely. Status: `open` · `claimed` · `in progress` · `done`. See
 
 | feature                              | owner   | status |
 |--------------------------------------|---------|--------|
-| Railgun (slow, high-dmg, piercing)   | tinyclaw | claimed |
+| Railgun (slow, high-dmg, piercing)   | tinyclaw | done ✅ (charge-hold/release, server-timed charge-gate, wall+body pierce; all server-authoritative — tools/railgun-test.mjs 10/10 + railgun-verify.mjs; charge HUD ring + muzzle glow + rail VFX. viewmodel art pending BMO on branch art/railgun) |
 | Plasma repeater (fast projectile)    | BMO     | done ✅ (hero viewmodel + video fire/reload anim) |
 | Riot scattergun (pellets, close)     | BMO     | done ✅ (video pump-action fire + reload anim) |
 | Weapon switching + pickups on map    | BMO     | done ✅ (server-authoritative grab/switch, per-weapon ammo) |

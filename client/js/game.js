@@ -52,6 +52,9 @@ const me = {
   moving: 0, bobPhase: 0, strafeLean: 0,
   clip: WEAPONS[DEFAULT_WEAPON].clip, fireT: -1e9, reloadUntil: 0, wasReloading: false,
   dead: false, weapon: DEFAULT_WEAPON, id: null,
+  // charge weapons (railgun): local hold clock for the HUD ring + viewmodel glow.
+  // The SERVER owns the real charge (it times C2S.CHARGE→SHOOT); this is presentation.
+  charging: false, chargeStart: 0,
   // per-weapon ammo mirror of the server loadout; `owned` = the ownership set.
   // Updated authoritatively by S2C.WEAPON (pickup / switch / reload / respawn), and
   // predicted locally between messages so the viewmodel + ammo HUD feel instant.
@@ -60,7 +63,7 @@ const me = {
 };
 const cam = { kickY: 0, kickX: 0, roll: 0, dmgFlash: 0, shake: 0, hitstop: 0,
   ventOffX: 0, ventOffY: 0, ventFlash: 0, door: 0, bodyPull: 0 };
-const vm = { flash: 0, kick: 0 };            // viewmodel fx
+const vm = { flash: 0, kick: 0, rail: 0, railCf: 0 };   // viewmodel fx (rail = first-person railgun beam flash)
 // reactive crosshair: bloom grows with recoil/movement + tightens when still;
 // hit/kill are hit-marker pips that pop on a confirmed landed shot (server truth).
 const cross = { bloom: 0, hit: 0, kill: 0 };
@@ -129,10 +132,15 @@ function airlockPull() {
 //                 server's instant hitscan, so a bolt you dodge on screen may have
 //                 already registered. Server-authoritative travel is the follow-up
 //                 (spawn/advance/collide the bolt on server.mjs, damage on arrival).
-const MAX_PARTICLES = 260, MAX_SPLATS = 140, MAX_BOLTS = 48;
+const MAX_PARTICLES = 260, MAX_SPLATS = 140, MAX_BOLTS = 48, MAX_BEAMS = 8;
 let particles = [];   // { x,y,z, dx,dy,dz, life, r,g,b, size, settle }
 let splats = [];      // settled gore: { x,y, r,g,b, size } — persistent, FIFO-capped
 let bolts = [];       // { x,y, dx,dy, life, r,g,b, own }
+// railgun rails: a bright INSTANT beam from shooter along the shot ray, drawn full
+// for a beat then faded. Unlike bolts it does not travel and is not wall-stopped — it
+// draws THROUGH walls (dimmed) to sell the pierce. cf (0..1) = charge → brightness/width.
+let beams = [];       // { x,y, dx,dy, len, life, maxLife, cf }
+const RAIL_RGB = hexRGB((WEAPONS.railgun && WEAPONS.railgun.color) || '#c86bff');   // rail tint, parsed once
 
 function spawnBurst(x, y, z, n, opts = {}) {
   if (IS_BOT) return;   // headless bot clients don't need the gore — save the box's CPU
@@ -204,6 +212,17 @@ function tickBolts(dt) {
     b.x = nx; b.y = ny;
   }
   if (bolts.length) bolts = bolts.filter((b) => b.life > 0);
+}
+// One instant railgun rail. Drawn (drawBeam, in the render pass) from (x,y) along the
+// ray for `len` cells; no travel, no collision. cf scales brightness + thickness.
+function spawnBeam(x, y, ang, len, cf) {
+  if (IS_BOT) return;
+  if (beams.length >= MAX_BEAMS) beams.shift();
+  beams.push({ x, y, dx: Math.cos(ang), dy: Math.sin(ang), len, life: 0.26, maxLife: 0.26, cf: Math.max(0, Math.min(1, cf)) });
+}
+function tickBeams(dt) {
+  for (const b of beams) b.life -= dt;
+  if (beams.length) beams = beams.filter((b) => b.life > 0);
 }
 
 // ---------------------------------------------------------------- assets (procedural)
@@ -333,6 +352,11 @@ const WEAPON_ART = {
   // balloons on wide-short (mobile-landscape) aspects. See GUN_TOP_Y in drawGun.
   scatter: { hero: null, fire: [], reload: [], meta: { topFrac: 0.24 } },
   plasma:  { hero: null, fire: [], reload: [], meta: { topFrac: 0.15 } },
+  // railgun adds a CHARGE strip (indexed by charge fraction 0→1, not by time): the coils
+  // spin up + the muzzle brightens as you hold. hero + fire + reload as usual. Until BMO's
+  // frames land in assets/art/railgun/, hero is null and drawGun's procedural charge glow
+  // carries it. `charge` count must match the frames BMO ships (coordinated on the branch).
+  railgun: { hero: null, charge: [], fire: [], reload: [], meta: { topFrac: 0.20 } },
 };
 function loadWeaponArt(key, counts = {}) {
   const art = WEAPON_ART[key]; if (!art) return;
@@ -344,6 +368,7 @@ function loadWeaponArt(key, counts = {}) {
 }
 loadWeaponArt('scatter', { reload: 8, fire: 5 });
 loadWeaponArt('plasma',  { reload: 8, fire: 5 });
+loadWeaponArt('railgun', { charge: 8, reload: 8, fire: 5 });   // BMO's strips: charge 8 (indexed 0→1), reload 8, fire 5
 
 // 8-way directional enemy billboards (Doom/Build-engine style). Index = the VIEW
 // the camera sees, going around the compass from S(front) counter-clockwise:
@@ -677,9 +702,39 @@ function render(t) {
       }
     }
   }
+  // railgun rail: sample the ray in world space, project each point (drawBolt's math)
+  // and paint a bright additive line. It is drawn THROUGH walls — occluded samples are
+  // dimmed rather than clipped — so you literally see the shot pierce the geometry.
+  function drawBeam(bm) {
+    const fade = bm.life / bm.maxLife;                 // 1 → 0 over the beam's life
+    const col = RAIL_RGB, bright = (0.45 + 0.55 * bm.cf) * fade;
+    const n = Math.max(2, (bm.len / 0.12) | 0);        // ~0.12-cell steps down the ray
+    for (let s = 0; s <= n; s++) {
+      const along = (s / n) * bm.len;
+      const relX = bm.x + bm.dx * along - ex, relY = bm.y + bm.dy * along - ey;
+      const pty = invDet * (-planeY * relX + planeX * relY);
+      if (pty <= 0.15 || pty > 60) continue;
+      const ptx = invDet * (dirY * relX - dirX * relY);
+      const sx = ((SCREEN_W / 2) * (1 + ptx / pty)) | 0;
+      if (sx < 0 || sx >= SCREEN_W) continue;
+      const sy = (HORIZON + (0.5 * PROJ) / pty - (0.05 * PROJ) / pty) | 0;   // chest line (matches bolts)
+      const amp = bright * (pty >= zbuf[sx] ? 0.3 : 1);  // behind a wall → ghosted (pierce)
+      const half = Math.max(1, Math.min(6, (0.11 * PROJ / pty) | 0));
+      for (let yy = sy - half; yy <= sy + half; yy++) {
+        if (yy < 0 || yy >= SCREEN_H) continue;
+        const f = amp * (1 - Math.abs(yy - sy) / (half + 1));
+        const i = yy * SCREEN_W + sx, px = fb[i];
+        fb[i] = packRGB(
+          Math.min(255, (px & 255) + col[0] * f + f * 130) | 0,
+          Math.min(255, ((px >> 8) & 255) + col[1] * f + f * 130) | 0,
+          Math.min(255, ((px >> 16) & 255) + col[2] * f + f * 130) | 0);
+      }
+    }
+  }
   for (const sp of splats) drawPoint(sp.x, sp.y, 0.006, sp.size, sp.r, sp.g, sp.b);
   for (const p of particles) drawPoint(p.x, p.y, Math.max(0.02, p.z), p.size, p.r, p.g, p.b);
   for (const b of bolts) drawBolt(b);
+  for (const bm of beams) drawBeam(bm);
 
   // --- OBJECTIVE: console props + capture rings (world billboards) ---
   // Reads objState only. Each console is a pedestal + emissive screen (owner's
@@ -831,10 +886,15 @@ function drawGun(ctx, t) {
   let frame = null, dip = 0, roll = 0;
   const hasReload = art && art.reload.some(Boolean);
   const hasFire = art && art.fire.some(Boolean);
+  const hasCharge = art && art.charge && art.charge.some(Boolean);
+  // charge progress for the viewmodel (whole-hold 0..1, so the coils spin up from idle)
+  const chargeK = (me.charging && wp.charge) ? Math.max(0, Math.min(1, (nowMs - me.chargeStart) / wp.charge.fullMs)) : 0;
   if (art && art.hero) {
     if (rem > 0 && hasReload) {
       const k = 1 - rem / wp.reloadMs;                                  // 0..1 through the reload
       frame = art.reload[Math.min(art.reload.length - 1, (k * art.reload.length) | 0)] || art.hero;
+    } else if (me.charging && hasCharge) {
+      frame = art.charge[Math.min(art.charge.length - 1, (chargeK * art.charge.length) | 0)] || art.hero;  // spin-up strip
     } else if (hasFire && (nowMs - me.fireT) < fireMs) {
       const k = (nowMs - me.fireT) / fireMs;                            // 0..1 through the shot
       frame = art.fire[Math.min(art.fire.length - 1, (k * art.fire.length) | 0)] || art.hero;
@@ -918,6 +978,46 @@ function drawGun(ctx, t) {
     ctx.closePath(); ctx.fill();
     ctx.restore();
   }
+
+  // railgun RAIL flash (first-person) — a rail fired down your own view axis collapses to
+  // the screen centre, so paint it as a bright vertical bloom from the muzzle up through the
+  // crosshair for a beat. (Other players see the world-space streak via drawBeam.) cf → width.
+  if (vm.rail > 0.02) {
+    const c = RAIL_RGB, a = vm.rail, topY = HORIZON - 4;      // up to just above the crosshair
+    const w = (3 + vm.railCf * 7) * (0.6 + 0.4 * a);
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const grd = ctx.createLinearGradient(cx - w, 0, cx + w, 0);
+    grd.addColorStop(0, `rgba(${c[0]},${c[1]},${c[2]},0)`);
+    grd.addColorStop(0.5, `rgba(255,255,255,${0.85 * a})`);
+    grd.addColorStop(1, `rgba(${c[0]},${c[1]},${c[2]},0)`);
+    ctx.fillStyle = grd;
+    ctx.fillRect(cx - w, topY, w * 2, muzzleY - topY);
+    // hot white core line
+    ctx.fillStyle = `rgba(255,255,255,${0.9 * a})`;
+    ctx.fillRect(cx - 0.6, topY, 1.2, muzzleY - topY);
+    ctx.restore();
+  }
+
+  // railgun CHARGE glow — an additive energy ball gathering at the muzzle that grows
+  // with the hold + a jitter, snapping white the moment it's armed (past charge.minMs).
+  // Purely procedural (works before BMO's charge strip lands; complements it after).
+  if (me.charging && wp.charge) {
+    const c = RAIL_RGB;
+    const armed = (nowMs - me.chargeStart) >= wp.charge.minMs;
+    const s = (6 + chargeK * 26) * (0.9 + 0.1 * Math.sin(nowMs / 45));   // grows + flickers
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.translate(cx + (Math.random() - 0.5) * chargeK * 3, muzzleY + (Math.random() - 0.5) * chargeK * 3);
+    const grd = ctx.createRadialGradient(0, 0, 0, 0, 0, s);
+    const core = armed ? '255,255,255' : '255,150,150';
+    grd.addColorStop(0, `rgba(${core},${0.5 + 0.45 * chargeK})`);
+    grd.addColorStop(0.5, `rgba(${c[0]},${c[1]},${c[2]},${0.5 * chargeK})`);
+    grd.addColorStop(1, `rgba(${c[0]},${c[1]},${c[2]},0)`);
+    ctx.fillStyle = grd;
+    ctx.beginPath(); ctx.arc(0, 0, s, 0, 6.2832); ctx.fill();
+    ctx.restore();
+  }
 }
 
 // ---------------------------------------------------------------- gameplay
@@ -935,6 +1035,7 @@ function moveMe(dx, dy) {
 
 function fire() {
   const wp = WEAPONS[me.weapon], nowMs = performance.now();
+  if (wp.charge) return;   // charge weapons fire on RELEASE via beginCharge/releaseCharge, never the auto-fire path
   if (me.dead || nowMs - me.fireT < wp.rateMs || nowMs < me.reloadUntil) return;
   if (me.clip <= 0) { startReload(); return; }
   me.clip--; me.clips[me.weapon] = me.clip; me.fireT = nowMs;
@@ -963,9 +1064,51 @@ function fire() {
   Net.shoot(me.ang, me.weapon);
   window.PlaytestLink && PlaytestLink.event('shot', { clip: me.clip, weapon: me.weapon });
 }
+
+// --- charge weapons (railgun): HOLD to spin up, RELEASE to fire -----------------
+// The SERVER times the real hold (C2S.CHARGE→SHOOT) and owns the fizzle/damage call.
+// These just drive the local clock (HUD ring, viewmodel glow, beam intensity) and the
+// optimistic clip prediction, mirroring what fire() does for instant weapons.
+function chargeFrac() {                       // 0 at charge.minMs, 1 at charge.fullMs
+  const wp = WEAPONS[me.weapon];
+  if (!me.charging || !wp.charge) return 0;
+  const held = performance.now() - me.chargeStart;
+  return Math.max(0, Math.min(1, (held - wp.charge.minMs) / (wp.charge.fullMs - wp.charge.minMs)));
+}
+function beginCharge() {
+  const wp = WEAPONS[me.weapon], nowMs = performance.now();
+  if (me.dead || me.charging || !wp.charge) return;
+  if (nowMs - me.fireT < wp.rateMs || nowMs < me.reloadUntil) return;
+  if (me.clip <= 0) { startReload(); return; }
+  me.charging = true; me.chargeStart = nowMs;
+  Net.charge();                                // start the server's authoritative clock
+  playSfx('railgun-charge', 0.5);
+}
+function releaseCharge() {
+  const wp = WEAPONS[me.weapon], nowMs = performance.now();
+  if (!me.charging) return;
+  const held = nowMs - me.chargeStart, cf = chargeFrac();
+  me.charging = false; me.chargeStart = 0;
+  // ALWAYS tell the server we let go, so it clears its charge clock (fizzle or shot).
+  Net.shoot(me.ang, me.weapon);
+  if (me.dead) return;
+  if (!wp.charge || held < wp.charge.minMs) { playSfx('railgun-fizzle', 0.4); return; }  // dud → no ammo, no beam
+  // real shot — predict the clip + recoil + rail exactly like fire() does for its weapon
+  me.clip--; me.clips[me.weapon] = me.clip; me.fireT = nowMs;
+  vm.flash = 1; vm.kick = 1; vm.rail = 1; vm.railCf = cf;   // first-person rail flash, scaled by charge
+  cam.kickY += 7 + cf * 4; cam.kickX += (Math.random() - 0.5) * 3.0;
+  cam.roll += (Math.random() - 0.5) * 0.02; cam.shake = Math.max(cam.shake, 2.2 + cf * 1.8);
+  cross.bloom = Math.min(1.7, cross.bloom + 1.2);
+  spawnBeam(me.x, me.y, me.ang, wp.range, cf);
+  playSfx(wp.fireSfx || 'railgun-fire');
+  window.PlaytestLink && PlaytestLink.event('shot', { clip: me.clip, weapon: me.weapon, charge: +cf.toFixed(2) });
+}
+function cancelCharge() { me.charging = false; me.chargeStart = 0; }
+
 function startReload() {
   const wp = WEAPONS[me.weapon], nowMs = performance.now();
   if (me.dead || nowMs < me.reloadUntil || me.clip >= wp.clip) return;
+  cancelCharge();                              // reloading cancels a charge (server does the same)
   me.reloadUntil = nowMs + wp.reloadMs; me.wasReloading = true;
   playSfx(wp.reloadSfx || 'reload');
   Net.reload(me.weapon);
@@ -975,6 +1118,7 @@ function startReload() {
 // instant viewmodel swap; the server confirms via S2C.WEAPON. Switching cancels a reload.
 function switchWeapon(key) {
   if (me.dead || key === me.weapon || !me.owned.has(key) || !WEAPONS[key]) return;
+  cancelCharge();                              // switching away cancels a charge (server does the same)
   me.weapon = key;
   me.clip = me.clips[key] ?? WEAPONS[key].clip; me.clips[key] = me.clip;
   me.reloadUntil = 0; me.wasReloading = false;
@@ -1021,6 +1165,11 @@ Net.onWelcome = (m) => {
 Net.on(S2C.WEAPON, (m) => {
   const grew = m.owned && m.owned.some((k) => !me.owned.has(k));
   if (m.owned) me.owned = new Set(m.owned);
+  // an authoritative weapon SWAP (pickup grant / server switch) invalidates any in-flight
+  // charge — cancel it, else me.charging can stay true onto a non-charge weapon and the
+  // charge HUD/viewmodel deref wp.charge. Only on a real change: the per-shot clip resync
+  // sends a same-weapon WEAPON, and cancelling there could kill a just-started next charge.
+  if (m.weapon !== me.weapon) cancelCharge();
   me.weapon = m.weapon;
   if (Number.isFinite(m.clip)) { me.clip = m.clip; me.clips[m.weapon] = m.clip; }
   me.reloadUntil = 0; me.wasReloading = false;
@@ -1034,11 +1183,13 @@ Net.on(S2C.PICKUP, (m) => { pickupTaken.set(m.id, !!m.taken); });
 // server-authoritative objective state @20Hz — render only, decide nothing
 Net.on(S2C.OBJECTIVE, onObjective);
 Net.on(S2C.SHOT, (m) => {
-  if (m.id === me.id) return;                 // my own bolt is spawned locally in fire()
+  if (m.id === me.id) return;                 // my own bolt/rail is spawned locally in fire()/releaseCharge()
   flashUntil.set(m.id, performance.now() + 90);
-  // a plasma bolt travels from the enemy along their shot vector — you SEE it come
   const sh = Net.players.get(m.id);
-  if (sh && Number.isFinite(m.ang)) spawnBolt(sh.x, sh.y, m.ang, false);
+  if (!sh || !Number.isFinite(m.ang)) return;
+  // railgun shots carry `charge` (0..1) — everyone sees the piercing rail, not a bolt
+  if (m.weapon === 'railgun') spawnBeam(sh.x, sh.y, m.ang, (WEAPONS.railgun && WEAPONS.railgun.range) || 60, m.charge ?? 0);
+  else spawnBolt(sh.x, sh.y, m.ang, false);   // a plasma bolt travels from the enemy — you SEE it come
 });
 Net.on(S2C.HIT, (m) => {
   // I took damage — punchy vignette + a flinch AWAY from the shooter's direction
@@ -1109,6 +1260,7 @@ let fireHeld = false;
 // touchFireHeld stays false unless the touch layer at the bottom of this file installs).
 const tmove = { f: 0, s: 0 };
 let touchFireHeld = false;
+let qaHeld = false;   // synthetic fire-intent for the __game QA hooks (routes charge through the real input path)
 if (!IS_BOT) {
   addEventListener('keydown', (e) => {
     if (window.PlaytestLink && (e.code === 'KeyT' || e.code === 'KeyM')) return; // owned by playtest-link
@@ -1162,6 +1314,7 @@ function frame(now) {
   // read authoritative bits about myself from server state
   const mine = Net.players.get(me.id);
   if (mine) { me.dead = mine.dead; me._hp = mine.hp; me._frags = mine.frags; }
+  if (me.dead && me.charging) cancelCharge();   // died mid-charge — drop the clock
 
   // reload completion (predicted; server also confirms via S2C.WEAPON)
   if (me.wasReloading && performance.now() >= me.reloadUntil) { me.clip = WEAPONS[me.weapon].clip; me.clips[me.weapon] = me.clip; me.wasReloading = false; }
@@ -1185,7 +1338,16 @@ function frame(now) {
       f += tmove.f; s += tmove.s;                   // mobile twin-stick (0,0 on desktop)
       if (keys.ArrowLeft) me.ang -= 2.4 * dt;
       if (keys.ArrowRight) me.ang += 2.4 * dt;
-      if (fireHeld || touchFireHeld) fire();         // touchFireHeld: always false on desktop
+      // fire input: instant weapons auto-fire while held; charge weapons (railgun)
+      // spin up on press and fire on RELEASE (server times the hold).
+      const held = fireHeld || touchFireHeld || qaHeld;   // qaHeld: synthetic intent for QA hooks
+      if (WEAPONS[me.weapon].charge) {
+        if (held && !me.charging) beginCharge();
+        else if (!held && me.charging) releaseCharge();
+      } else {
+        if (me.charging) cancelCharge();             // e.g. switched off a charge weapon mid-hold
+        if (held) fire();
+      }
     }
     if (!me.dead) {
       const len = Math.hypot(f, s); if (len > 1) { f /= len; s /= len; }
@@ -1197,13 +1359,15 @@ function frame(now) {
       me.strafeLean += (s - me.strafeLean) * Math.min(1, dt * 6);
     }
 
-    // combat feel: advance gore + traveling bolts
+    // combat feel: advance gore + traveling bolts + fading rails
     tickParticles(dt);
     tickBolts(dt);
+    tickBeams(dt);
 
     // decay fx (springs)
     vm.flash = Math.max(0, vm.flash - dt * 8);
     vm.kick = Math.max(0, vm.kick - dt * 6);
+    vm.rail = Math.max(0, vm.rail - dt * 6);      // first-person rail flash (~165ms)
     cam.kickY *= Math.max(0, 1 - dt * 9);
     cam.kickX *= Math.max(0, 1 - dt * 9);
     cam.roll *= Math.max(0, 1 - dt * 7);
@@ -1288,6 +1452,30 @@ function drawCrosshair(ctx) {
       ctx.lineTo(cx + sx * (hr + hl), cy + sy * (hr + hl));
     }
     ctx.stroke();
+  }
+  // CHARGE RING (railgun): a ring that sweeps clockwise from 12 o'clock as you hold.
+  // DIM red arc = still under the min gate (a release now duds); it snaps to the rail
+  // colour + a full white pulse the instant you're armed, so the min/full timing is
+  // legible without looking at the ammo. Whole thing only shows while charging.
+  if (me.charging && WEAPONS[me.weapon].charge) {   // wp.charge guard mirrors drawGun (defends a mid-charge weapon swap)
+    const wp = WEAPONS[me.weapon];
+    const held = performance.now() - me.chargeStart;
+    const armed = held >= wp.charge.minMs;
+    const cf = chargeFrac();                                  // 0 at min, 1 at full
+    const sweep = Math.max(0, Math.min(1, held / wp.charge.fullMs));  // whole-hold fill 0..1
+    const R = 12;
+    ctx.globalAlpha = armed ? 0.95 : 0.55;
+    ctx.lineWidth = armed ? 2 : 1.4;
+    ctx.strokeStyle = armed ? 'rgba(200,107,255,1)' : 'rgba(255,80,80,1)';
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, -Math.PI / 2, -Math.PI / 2 + sweep * Math.PI * 2);
+    ctx.stroke();
+    if (cf >= 1) {                                            // fully charged — bright pulse ring
+      ctx.globalAlpha = 0.6 + 0.4 * Math.sin(performance.now() / 60);
+      ctx.strokeStyle = 'rgba(255,255,255,1)';
+      ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.arc(cx, cy, R + 2.5, 0, Math.PI * 2); ctx.stroke();
+    }
   }
   ctx.restore();
 }
@@ -1387,6 +1575,11 @@ window.__game = {
   teleport(x, y, ang) { me.x = x; me.y = y; if (ang !== undefined) me.ang = ang; },
   setPos(x, y, ang) { this.teleport(x, y, ang); },
   fire() { me.fireT = -1e9; fire(); },
+  charge() { me.fireT = -1e9; qaHeld = true; },        // QA: press-and-hold (the loop starts the charge)
+  release() { qaHeld = false; },                       // QA: let go → the loop fires/fizzles per hold time
+  get charging() { return me.charging; },             // QA: mid-charge?
+  get chargeFrac() { return chargeFrac(); },          // QA: 0 at min-gate, 1 at full
+  get beams() { return beams.length; },               // QA: live rail count
   reload() { startReload(); },                       // QA: trigger a reload
   switchWeapon(k) { switchWeapon(k); },              // QA: request a switch
   start() { started = true; const o = document.getElementById('overlay'); if (o) o.classList.add('hide'); }, // QA: enter without a click

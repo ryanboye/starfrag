@@ -67,6 +67,7 @@ export const Net = {
   },
   move(x, y, ang, moving) { this.send({ t: C2S.MOVE, x, y, ang, moving }); },
   shoot(ang, weapon) { this.send({ t: C2S.SHOOT, ang, weapon }); },   // weapon is advisory; server uses its authoritative one
+  charge() { this.send({ t: C2S.CHARGE }); },                         // charge weapons: start the SERVER-side charge clock (it times the hold)
   reload(weapon) { this.send({ t: C2S.RELOAD, weapon }); },
   switchWeapon(weapon) { this.send({ t: C2S.SWITCH, weapon }); },
 };
