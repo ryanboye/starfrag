@@ -23,7 +23,8 @@ import {
   WEAPONS, DEFAULT_WEAPON, STARTING_WEAPONS, WEAPON_PICKUP_RESPAWN_MS,
   WEAPON_PICKUP_RADIUS, PLAYER_COLORS, PROTOCOL_VERSION, OBJECTIVE,
 } from '../shared/protocol.js';
-import { compileMap, raycast, pickArena } from '../shared/map.js';
+import { compileMap, raycast, pickArena, isSolidCell } from '../shared/map.js';
+import { createBot } from '../client/js/bot.js';   // the ?bot=1 brain, reused verbatim server-side
 
 const PORT = +(process.env.STARFRAG_PORT || 8791);
 const HOST = process.env.STARFRAG_HOST || '127.0.0.1';
@@ -32,10 +33,26 @@ const HOST = process.env.STARFRAG_HOST || '127.0.0.1';
 // 'hangar-bay'); unset → the default derelict deck. Rotation is a future feature.
 const arena = pickArena(process.env.STARFRAG_MAP);
 const map = compileMap(arena);       // { W, H, grid, spawns, ... }
-const players = new Map();           // id -> player record
+const players = new Map();           // id -> player record (humans AND bots)
 let nextId = 1;
 let colorIx = 0;
 let spawnIx = 0;
+
+// --- SERVER-SIDE BOTS: on-demand, in-process AI opponents (no browser) --------
+// A bot is an internal player entity that lives in `players` (so every human sees it
+// via the normal STATE broadcast, identical to a real player) AND in `bots` (for the
+// AI tick). It reuses the exact client ?bot=1 brain (client/js/bot.js createBot) via a
+// server-side `api` shim, and is driven by the SERVER's own movement + fire resolution
+// — so bots are naturally server-authoritative and keep bot.js's human-fair (no-aimbot)
+// aim handicaps. Lifecycle: spawned when a human is present, ALL despawned when the last
+// one leaves, so an idle server runs zero bot AI. STARFRAG_BOTS (default 3) = the count a
+// lone human faces; set 0 to disable (e.g. isolation QA harnesses).
+const TARGET_BOTS = Math.max(0, +(process.env.STARFRAG_BOTS ?? 3) || 0);
+const BOT_WS = { readyState: 3 };    // stub socket: send()/broadcast() only touch OPEN(1) sockets, so bots are skipped
+const BOT_NAMES = ['VEX', 'HELIX', 'NOVA', 'RAZR', 'ONYX', 'ZEPH', 'KILO', 'JINX', 'WISP', 'ORBIT', 'FANG', 'ECHO'];
+const bots = new Map();              // id -> bot record (a subset of `players`)
+let botNameIx = 0;
+let botLast = 0;                     // timestamp of the last bot tick (for dt)
 
 function pickSpawn() {
   // round-robin through the named spawns, nudged so two joins in a row differ
@@ -113,6 +130,21 @@ function respawn(p) {
   p.reloadUntil = 0; p.respawnAt = 0; p.chargeStart = 0;
   broadcast({ t: S2C.SPAWN, id: p.id, x: p.x, y: p.y, ang: p.ang });
   sendWeapon(p);   // reset the client viewmodel to the carbine
+}
+
+// Start a reload of p's CURRENT weapon. Shared by the C2S.RELOAD handler and by bots
+// (api.reload). Guards: alive, not mid-reload, mag not already full. Completes on a timer
+// only if p still exists, is alive, and still holds the same weapon. Reloading cancels a charge.
+function beginReload(p) {
+  const key = p.weapon;
+  const wp = WEAPONS[key];
+  p.chargeStart = 0;
+  if (!p.dead && Date.now() >= p.reloadUntil && (p.clips[key] || 0) < wp.clip) {
+    p.reloadUntil = Date.now() + wp.reloadMs;
+    setTimeout(() => {
+      if (players.has(p.id) && !p.dead && p.weapon === key) { p.clips[key] = wp.clip; sendWeapon(p); }
+    }, wp.reloadMs);
+  }
 }
 
 // --- AIRLOCK OBJECTIVE: server-authoritative capture-point win mode ---------
@@ -330,8 +362,129 @@ function resolveShot(shooter, ang, chargeFrac = 0) {
   }
 }
 
+// --- bot AI plumbing --------------------------------------------------------
+// The `api` shim createBot(api) expects. It reads state (world/players/me) and emits
+// intent (setMove/fire/reload); it never touches pixels, so it runs fine here. `me` is
+// the bot's own record — bot.js reads me.id/x/y/ang/dead/clip and WRITES me.ang (its aim),
+// which lands straight on the broadcast field, so every human sees the bot turn.
+function botApi(bot) {
+  return {
+    me: bot,
+    players: () => [...players.values()].filter((p) => p.joined),   // bots fight humans AND each other
+    world: map, spawns: map.spawns,
+    fire: () => botFire(bot),
+    reload: () => beginReload(bot),
+    setMove: (f, s) => { bot._botF = f; bot._botS = s; },
+  };
+}
+
+// A bot record has the SAME shape makePlayer builds (so stateOf/resolveShot/respawn treat
+// it identically), plus isBot, a compiled think(dt), and a live scalar `clip` view that
+// bot.js reads (the human client carries `me.clip`; the server carries per-weapon `clips`).
+function makeBot() {
+  const id = nextId++;
+  const color = PLAYER_COLORS[colorIx++ % PLAYER_COLORS.length];
+  const spawn = pickSpawn();
+  const lo = freshLoadout();
+  const bot = {
+    id, ws: BOT_WS, color, name: BOT_NAMES[botNameIx++ % BOT_NAMES.length],
+    x: spawn.x, y: spawn.y, ang: spawn.ang,
+    hp: PLAYER_HP, frags: 0, dead: false, moving: 0,
+    weapon: lo.weapon, clips: lo.clips,
+    lastShot: 0, reloadUntil: 0, respawnAt: 0, fireT: 1e9, chargeStart: 0,
+    joined: true, isBot: true, _botF: 0, _botS: 0,
+  };
+  Object.defineProperty(bot, 'clip', { get() { return this.clips[this.weapon] ?? 0; }, configurable: true });
+  bot.think = createBot(botApi(bot));
+  return bot;
+}
+
+// Bots fire through the SERVER's own resolveShot (authoritative — same ammo/rate gates as a
+// human). Charge weapons (a railgun pickup) start the server charge clock here; updateBots
+// releases at full charge. The no-aimbot handicaps live in bot.js and are untouched.
+function botFire(bot) {
+  if (bot.dead) return;
+  const wp = WEAPONS[bot.weapon] || WEAPONS[DEFAULT_WEAPON];
+  if (wp.charge) { if (!bot.chargeStart) bot.chargeStart = Date.now(); return; }
+  resolveShot(bot, bot.ang);
+}
+
+// Server-side movement — a faithful port of the client's moveMe(): humans are movement-
+// authoritative, so for a bot the server IS the client. Same SPEED, same 0.22 body radius,
+// same axis-separated wall slide, same bounds clamp as the C2S.MOVE path.
+function botBlocked(x, y, r) {
+  for (let ty = (y - r) | 0; ty <= (y + r) | 0; ty++)
+    for (let tx = (x - r) | 0; tx <= (x + r) | 0; tx++)
+      if (isSolidCell(map.grid, map.W, map.H, tx, ty)) return true;
+  return false;
+}
+function moveBot(bot, f, s, dt) {
+  let len = Math.hypot(f, s);
+  if (len < 1e-3) { bot.moving = 0; return; }
+  if (len > 1) { f /= len; s /= len; }
+  const SPEED = 3.4, r = 0.22;
+  const dirX = Math.cos(bot.ang), dirY = Math.sin(bot.ang);
+  const dx = (dirX * f - dirY * s) * SPEED * dt, dy = (dirY * f + dirX * s) * SPEED * dt;
+  if (!botBlocked(bot.x + dx, bot.y, r)) bot.x += dx;
+  if (!botBlocked(bot.x, bot.y + dy, r)) bot.y += dy;
+  bot.x = Math.max(0.2, Math.min(map.W - 0.2, bot.x));
+  bot.y = Math.max(0.2, Math.min(map.H - 0.2, bot.y));
+  bot.moving = 1;
+}
+
+// --- bot lifecycle ----------------------------------------------------------
+const humanCount = () => { let n = 0; for (const p of players.values()) if (!p.isBot && p.joined) n++; return n; };
+
+function spawnBot() {
+  const bot = makeBot();
+  players.set(bot.id, bot);
+  bots.set(bot.id, bot);
+  broadcast({ t: S2C.SPAWN, id: bot.id, x: bot.x, y: bot.y, ang: bot.ang });   // humans get name/color on the next STATE
+}
+function despawnBot(bot) {
+  bots.delete(bot.id);
+  players.delete(bot.id);
+  broadcast({ t: S2C.LEAVE, id: bot.id });
+}
+
+// Desired bot count: 0 when no humans are present (idle → zero AI), else top up so a lone
+// human faces TARGET_BOTS and each extra human replaces one bot (headcount ≈ TARGET_BOTS+1).
+function desiredBots() {
+  const humans = humanCount();
+  return humans <= 0 ? 0 : Math.max(0, TARGET_BOTS - (humans - 1));
+}
+function reconcileBots() {
+  const want = TARGET_BOTS <= 0 ? 0 : desiredBots();
+  const before = bots.size;
+  while (bots.size < want) spawnBot();
+  while (bots.size > want) despawnBot([...bots.values()][bots.size - 1]);
+  if (bots.size !== before) console.log(`[starfrag] bots -> ${bots.size} (humans ${humanCount()})`);
+}
+
+// Per-tick bot AI. No-op (one Map size check) when no bots are live — the idle case.
+function updateBots(now) {
+  if (bots.size === 0) { botLast = now; return; }
+  const dt = Math.min(0.05, (now - botLast) / 1000 || 0.05);   // clamp like the client's frame dt
+  botLast = now;
+  for (const bot of bots.values()) {
+    const wp = WEAPONS[bot.weapon] || WEAPONS[DEFAULT_WEAPON];
+    if (wp.charge && bot.chargeStart) {                        // release a full-charge railgun shot
+      if (bot.dead) bot.chargeStart = 0;
+      else if (now - bot.chargeStart >= wp.charge.fullMs) {
+        const cf = Math.max(0, Math.min(1, (now - bot.chargeStart - wp.charge.minMs) / (wp.charge.fullMs - wp.charge.minMs)));
+        resolveShot(bot, bot.ang, cf);
+        bot.chargeStart = 0;
+      }
+    }
+    bot._botF = 0; bot._botS = 0;
+    bot.think(dt);                                             // AI: aim (writes bot.ang) + setMove/fire/reload
+    if (!bot.dead) moveBot(bot, bot._botF, bot._botS, dt);
+  }
+}
+
 const wss = new WebSocketServer({ host: HOST, port: PORT });
 console.log(`[starfrag] authoritative arena "${map.name}" on ws://${HOST}:${PORT} (protocol v${PROTOCOL_VERSION})`);
+console.log(`[starfrag] server-side bots: ${TARGET_BOTS > 0 ? `on-demand, target ${TARGET_BOTS} for a lone human` : 'disabled (STARFRAG_BOTS=0)'}`);
 
 wss.on('connection', (ws) => {
   const p = makePlayer(ws);
@@ -356,6 +509,7 @@ wss.on('connection', (ws) => {
         });
         broadcast({ t: S2C.SPAWN, id: p.id, x: p.x, y: p.y, ang: p.ang });
         sendWeapon(p);   // seed the client's authoritative loadout
+        reconcileBots(); // human present → spawn/top-up bots (they arrive on this human's next STATE)
         break;
       }
       case C2S.MOVE: {
@@ -394,19 +548,9 @@ wss.on('connection', (ws) => {
         // fire pressed on a charge weapon → start the server's charge clock (idempotent while held)
         if (!p.dead) { const w = WEAPONS[p.weapon]; if (w && w.charge && !p.chargeStart) p.chargeStart = Date.now(); }
         break;
-      case C2S.RELOAD: {
-        const key = p.weapon;
-        const wp = WEAPONS[key];
-        p.chargeStart = 0;                                    // reloading cancels a charge
-        if (!p.dead && Date.now() >= p.reloadUntil && (p.clips[key] || 0) < wp.clip) {
-          p.reloadUntil = Date.now() + wp.reloadMs;
-          setTimeout(() => {
-            // only complete if still alive AND still holding the same weapon
-            if (players.has(p.id) && !p.dead && p.weapon === key) { p.clips[key] = wp.clip; sendWeapon(p); }
-          }, wp.reloadMs);
-        }
+      case C2S.RELOAD:
+        beginReload(p);
         break;
-      }
       case C2S.SWITCH: {
         // switch to an OWNED weapon (ownership = a key in p.clips). Cancels a reload.
         const key = m.weapon;
@@ -425,16 +569,22 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     players.delete(p.id);
     broadcast({ t: S2C.LEAVE, id: p.id });
+    reconcileBots();   // human left → refill a bot, or (last human gone) despawn ALL bots
   });
   ws.on('error', () => {});
 });
 
 // --- authoritative tick: respawns + state broadcast at TICK_HZ -------------
 setInterval(() => {
+  // EMPTY-SERVER GUARD: with nobody connected (no humans AND — after despawn-on-empty —
+  // no bots), skip the whole tick: no sim, no JSON.stringify, no broadcast. The interval
+  // keeps firing, so this re-arms the instant a client connects (players.size ≥ 1). (smcgrl)
+  if (players.size === 0) return;
   const now = Date.now();
   for (const p of players.values()) {
     if (p.dead && p.respawnAt && now >= p.respawnAt) respawn(p);
   }
+  updateBots(now);       // drive in-process bot AI (no-op when no bots are live)
   updateObjective(now);
   updatePickups(now);
   broadcast({ t: S2C.STATE, players: [...players.values()].filter((p) => p.joined).map(stateOf) });
