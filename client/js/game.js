@@ -1412,21 +1412,26 @@ function frame(now) {
   netAcc += dt;
   if (netAcc >= 0.05) { netAcc = 0; if (Net.connected) Net.move(+me.x.toFixed(3), +me.y.toFixed(3), +me.ang.toFixed(3), me.moving > 0.2 ? 1 : 0); }
 
-  // draw — composite the world with camera kick, roll and a hit-shake jitter
-  render(t);
-  const shx = cam.shake ? (Math.random() - 0.5) * cam.shake : 0;
-  const shy = cam.shake ? (Math.random() - 0.5) * cam.shake : 0;
-  sctx.save();
-  sctx.fillStyle = '#05060a'; sctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
-  sctx.translate(SCREEN_W / 2, SCREEN_H / 2);
-  sctx.rotate(cam.roll);
-  const over = 1 + Math.abs(cam.roll) * 1.6;      // scale up to hide corners the roll exposes
-  sctx.scale(over, over);
-  sctx.drawImage(off, -SCREEN_W / 2 + cam.kickX * 0.3 + shx, -SCREEN_H / 2 + cam.kickY * 0.3 + shy);
-  sctx.restore();
-  if (!me.dead) drawGun(sctx, t);
-  if (!me.dead && !IS_BOT) drawCrosshair(sctx);
-  updateHUD();
+  // draw — composite the world with camera kick, roll and a hit-shake jitter.
+  // SKIP the entire draw for bots: their AI runs off server state, never reads a
+  // pixel, so software-rendering raycaster frames just pins a CPU core for nothing
+  // (tinyclaw/VoX load flag). Game logic + net above still run at full rate.
+  if (!IS_BOT) {
+    render(t);
+    const shx = cam.shake ? (Math.random() - 0.5) * cam.shake : 0;
+    const shy = cam.shake ? (Math.random() - 0.5) * cam.shake : 0;
+    sctx.save();
+    sctx.fillStyle = '#05060a'; sctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
+    sctx.translate(SCREEN_W / 2, SCREEN_H / 2);
+    sctx.rotate(cam.roll);
+    const over = 1 + Math.abs(cam.roll) * 1.6;      // scale up to hide corners the roll exposes
+    sctx.scale(over, over);
+    sctx.drawImage(off, -SCREEN_W / 2 + cam.kickX * 0.3 + shx, -SCREEN_H / 2 + cam.kickY * 0.3 + shy);
+    sctx.restore();
+    if (!me.dead) drawGun(sctx, t);
+    if (!me.dead) drawCrosshair(sctx);
+  }
+  updateHUD();   // cheap DOM (no GPU) — keep it for bots too, feeds state hooks
 }
 
 // reactive crosshair + hit-marker, drawn straight on the display canvas so it
