@@ -160,10 +160,11 @@ export const ARENA = {
     // === WEAPON PICKUPS: walk over one to grab + switch to it (server-authoritative).
     // Placed to pull players across the map: the scattergun sits exposed in the
     // north gallery under the planet window; the plasma repeater is out on the west
-    // conduit flank. (Add a { kind:'weapon', weapon:'railgun' } here once tinyclaw's
-    // railgun stats land in WEAPONS — the pickup/switch system grants it for free.)
+    // conduit flank; the RAILGUN sits on the exposed core floor (center, sightlined
+    // from every zone) — the contested power weapon its long pierce is built for.
     { id: 'weapon-scatter', type: 'pickup', kind: 'weapon', weapon: 'scatter', x: 15.5, y: 3 },
     { id: 'weapon-plasma',  type: 'pickup', kind: 'weapon', weapon: 'plasma',  x: 2.5,  y: 15.5 },
+    { id: 'weapon-railgun', type: 'pickup', kind: 'weapon', weapon: 'railgun', x: 16,   y: 13 },
   ],
 };
 

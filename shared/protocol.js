@@ -82,9 +82,25 @@ export const WEAPONS = {
     range: 38,
     fireSfx: 'plasma-fire', reloadSfx: 'plasma-reload',
   },
-  // slot 4 — RAILGUN reserved for tinyclaw. When its stats land here and a
-  // `{ kind:'weapon', weapon:'railgun' }` pickup is placed in a deck, the pickup +
-  // switch SYSTEM below grants/switches to it with ZERO extra wiring.
+  // RAILGUN — slow, huge-damage, WALL-PIERCING charge-hitscan power weapon (tinyclaw).
+  // HOLD fire to charge, RELEASE to fire: below charge.minMs = no shot (fizzle); damage
+  // scales dmgLo→dmgHi over [minMs, fullMs]. `pierce` = the ray passes through walls AND
+  // bodies, hitting every target along `range`. Both the charge level and the pierce set
+  // are resolved SERVER-side (server times the hold via C2S.CHARGE→C2S.SHOOT) — a client
+  // that lies about its charge or trusts its own hitscan can't cheat. See resolveShot.
+  railgun: {
+    name: 'RAILGUN', slot: 4, color: '#c86bff',
+    rateMs: 250,       // post-release floor; the real gate is the charge time
+    clip: 3,
+    reloadMs: 1900,
+    pellets: 1,
+    spread: 0,         // a perfectly straight rail
+    dmgLo: 34, dmgHi: 110,   // min-charge tap → full-charge (one-shots a 100 HP body)
+    range: 60,               // longest in the game — it's a line weapon
+    fireSfx: 'railgun-fire', reloadSfx: 'railgun-reload',
+    charge: { minMs: 250, fullMs: 1100 },   // hold time → damage scale; < minMs = fizzle
+    pierce: true,                            // through walls + every body along range
+  },
 };
 export const DEFAULT_WEAPON = 'carbine';
 // What every player spawns owning. Picked-up weapons are LOST on death (drop-on-death
@@ -101,7 +117,8 @@ export const WEAPON_PICKUP_RADIUS = 0.75;   // cells — walk this close to grab
 export const C2S = {
   JOIN:   'join',    // { name }
   MOVE:   'move',    // { x, y, ang, moving }   client-authoritative position (scaffold)
-  SHOOT:  'shoot',   // { ang }                 server hitscans with the player's AUTHORITATIVE weapon
+  SHOOT:  'shoot',   // { ang }                 server hitscans with the player's AUTHORITATIVE weapon (charge weapons: server times the hold)
+  CHARGE: 'charge',  // { }                     fire pressed on a charge weapon → start the server-side charge clock
   RELOAD: 'reload',  // { }                     reload the current weapon
   SWITCH: 'switch',  // { weapon }              request a switch to an owned weapon
   PING:   'ping',    // { ts }
@@ -111,7 +128,7 @@ export const C2S = {
 export const S2C = {
   WELCOME: 'welcome', // { id, spawn:{x,y,ang}, mapName, players:[state...] }
   STATE:   'state',   // { players:[ {id,name,color,x,y,ang,hp,frags,dead,fireT,reloading} ] }
-  SHOT:    'shot',    // { id, ang, weapon }   -> render a muzzle flash on player `id`
+  SHOT:    'shot',    // { id, ang, weapon, charge? }  -> muzzle flash on `id`; charge (0..1) present for the railgun -> beam intensity
   WEAPON:  'weapon',  // { weapon, clip, owned:[keys] }  -> YOUR authoritative weapon/ammo changed
   PICKUP:  'pickup',  // { id, taken }         -> a map weapon-pickup became (un)available
   HIT:     'hit',     // { id, by, dmg, hp }   -> player `id` took damage from `by`

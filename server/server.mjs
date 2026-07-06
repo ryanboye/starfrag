@@ -63,7 +63,7 @@ function makePlayer(ws) {
     hp: PLAYER_HP, frags: 0, dead: false,
     moving: 0,
     weapon: lo.weapon, clips: lo.clips,   // current weapon + per-weapon ammo
-    lastShot: 0, reloadUntil: 0, respawnAt: 0, fireT: 1e9,
+    lastShot: 0, reloadUntil: 0, respawnAt: 0, fireT: 1e9, chargeStart: 0,
     joined: false,
   };
 }
@@ -83,7 +83,7 @@ function giveWeapon(p, key, { switchTo = true } = {}) {
   const wp = WEAPONS[key];
   if (!wp) return false;
   p.clips[key] = wp.clip;                 // full mag on pickup
-  if (switchTo) { p.weapon = key; p.reloadUntil = 0; }   // switching cancels a reload
+  if (switchTo) { p.weapon = key; p.reloadUntil = 0; p.chargeStart = 0; }   // switching cancels a reload + any charge
   return true;
 }
 
@@ -110,7 +110,7 @@ function respawn(p) {
   p.x = spawn.x; p.y = spawn.y; p.ang = spawn.ang;
   p.hp = PLAYER_HP; p.dead = false;
   const lo = freshLoadout(); p.weapon = lo.weapon; p.clips = lo.clips;   // drop picked-up weapons
-  p.reloadUntil = 0; p.respawnAt = 0;
+  p.reloadUntil = 0; p.respawnAt = 0; p.chargeStart = 0;
   broadcast({ t: S2C.SPAWN, id: p.id, x: p.x, y: p.y, ang: p.ang });
   sendWeapon(p);   // reset the client viewmodel to the carbine
 }
@@ -256,7 +256,27 @@ function updateObjective(now) {
 // first wall, and hit the nearest player body the ray passes within HIT_RADIUS.
 // The weapon is the shooter's AUTHORITATIVE current weapon (the client can't spoof
 // which gun it's holding — only the server decides that from pickups/switches).
-function resolveShot(shooter, ang) {
+// Apply one hit (damage + death/frag broadcast). Shared by the nearest-body path and
+// the railgun's pierce path (which calls it once per body along the ray).
+function applyHit(shooter, target, dmg, weaponKey, now) {
+  target.hp = Math.max(0, target.hp - dmg);
+  broadcast({ t: S2C.HIT, id: target.id, by: shooter.id, dmg, hp: target.hp });
+  if (target.hp <= 0 && !target.dead) {
+    target.dead = true;
+    target.respawnAt = now + RESPAWN_MS;
+    shooter.frags++;
+    broadcast({
+      t: S2C.KILL, id: target.id, by: shooter.id, weapon: weaponKey,
+      names: { id: target.name, by: shooter.name },
+    });
+  }
+}
+
+// `chargeFrac` (0..1) is authoritative for charge weapons — the caller derives it from the
+// SERVER-timed hold (C2S.CHARGE→SHOOT), never from a client-sent value. Non-charge weapons
+// ignore it and roll dmgLo..dmgHi as before. Pierce weapons ignore wall occlusion and hit
+// EVERY body along `range`, not just the nearest.
+function resolveShot(shooter, ang, chargeFrac = 0) {
   const weaponKey = shooter.weapon;
   const wp = WEAPONS[weaponKey] || WEAPONS[DEFAULT_WEAPON];
   const now = Date.now();
@@ -269,39 +289,43 @@ function resolveShot(shooter, ang) {
   shooter.clips[weaponKey]--;
   shooter.fireT = now;
 
-  // tell everyone the shooter fired (muzzle flash on their billboard)
-  broadcast({ t: S2C.SHOT, id: shooter.id, ang, weapon: weaponKey });
+  // damage source: charge weapons scale lo→hi by the server-timed charge; others roll lo..hi
+  const cf = wp.charge ? Math.max(0, Math.min(1, chargeFrac)) : 0;
+  const dmgFor = wp.charge
+    ? () => Math.round(wp.dmgLo + (wp.dmgHi - wp.dmgLo) * cf)
+    : () => Math.round(wp.dmgLo + Math.random() * (wp.dmgHi - wp.dmgLo));
+
+  // tell everyone the shooter fired (muzzle flash on their billboard; charge → beam intensity)
+  broadcast({ t: S2C.SHOT, id: shooter.id, ang, weapon: weaponKey, ...(wp.charge ? { charge: cf } : {}) });
 
   for (let pel = 0; pel < wp.pellets; pel++) {
     const a = ang + (wp.spread ? (Math.random() - 0.5) * 2 * wp.spread : 0);
     const dx = Math.cos(a), dy = Math.sin(a);
     const wall = raycast(map.grid, map.W, map.H, shooter.x, shooter.y, dx, dy, wp.range);
+    const maxAlong = wp.pierce ? wp.range : wall.dist;   // pierce ignores wall occlusion
 
-    // nearest body along the ray, in front of the wall
-    let best = null, bestAlong = Infinity;
-    for (const t of players.values()) {
-      if (t.id === shooter.id || t.dead) continue;
-      const tx = t.x - shooter.x, ty = t.y - shooter.y;
-      const along = tx * dx + ty * dy;              // projection down the ray
-      if (along <= 0 || along > wall.dist) continue; // behind shooter / behind wall
-      const perp = Math.abs(tx * dy - ty * dx);      // perpendicular distance to ray
-      if (perp > HIT_RADIUS) continue;
-      if (along < bestAlong) { bestAlong = along; best = t; }
-    }
-    if (!best) continue;
-
-    const dmg = Math.round(wp.dmgLo + Math.random() * (wp.dmgHi - wp.dmgLo));
-    best.hp = Math.max(0, best.hp - dmg);
-    broadcast({ t: S2C.HIT, id: best.id, by: shooter.id, dmg, hp: best.hp });
-
-    if (best.hp <= 0 && !best.dead) {
-      best.dead = true;
-      best.respawnAt = now + RESPAWN_MS;
-      shooter.frags++;
-      broadcast({
-        t: S2C.KILL, id: best.id, by: shooter.id, weapon: weaponKey,
-        names: { id: best.name, by: shooter.name },
-      });
+    if (wp.pierce) {
+      // hit EVERY body within HIT_RADIUS along [0, range] — through walls and through bodies
+      for (const t of players.values()) {
+        if (t.id === shooter.id || t.dead) continue;
+        const tx = t.x - shooter.x, ty = t.y - shooter.y;
+        const along = tx * dx + ty * dy;
+        if (along <= 0 || along > maxAlong) continue;
+        if (Math.abs(tx * dy - ty * dx) > HIT_RADIUS) continue;
+        applyHit(shooter, t, dmgFor(), weaponKey, now);
+      }
+    } else {
+      // nearest body along the ray, in front of the wall (standard hitscan)
+      let best = null, bestAlong = Infinity;
+      for (const t of players.values()) {
+        if (t.id === shooter.id || t.dead) continue;
+        const tx = t.x - shooter.x, ty = t.y - shooter.y;
+        const along = tx * dx + ty * dy;              // projection down the ray
+        if (along <= 0 || along > maxAlong) continue; // behind shooter / behind wall
+        if (Math.abs(tx * dy - ty * dx) > HIT_RADIUS) continue; // perpendicular distance to ray
+        if (along < bestAlong) { bestAlong = along; best = t; }
+      }
+      if (best) applyHit(shooter, best, dmgFor(), weaponKey, now);
     }
   }
 }
@@ -344,13 +368,36 @@ wss.on('connection', (ws) => {
         p.moving = m.moving ? 1 : 0;
         break;
       }
-      case C2S.SHOOT:
-        // the server hitscans with p's AUTHORITATIVE weapon (client can't spoof it)
-        if (!p.dead && Number.isFinite(m.ang)) resolveShot(p, m.ang);
+      case C2S.SHOOT: {
+        // the server hitscans with p's AUTHORITATIVE weapon (client can't spoof it).
+        // Charge weapons: the server TIMES the hold (C2S.CHARGE → now) — the client's
+        // claimed charge is never trusted; released below charge.minMs = a fizzle.
+        if (p.dead || !Number.isFinite(m.ang)) break;
+        const wp = WEAPONS[p.weapon] || WEAPONS[DEFAULT_WEAPON];
+        if (wp.charge) {
+          const held = p.chargeStart ? (Date.now() - p.chargeStart) : 0;
+          p.chargeStart = 0;
+          if (held >= wp.charge.minMs) {                      // past the gate → a real shot (else a fizzle: no shot, no ammo)
+            const cf = Math.max(0, Math.min(1, (held - wp.charge.minMs) / (wp.charge.fullMs - wp.charge.minMs)));
+            resolveShot(p, m.ang, cf);
+          }
+          // resync the authoritative clip: the server times the charge on its own clock, so
+          // the client's fizzle-vs-shot prediction can differ by a round at the minMs boundary
+          // under ping jitter. One WEAPON message per trigger corrects it (charge weapons are slow).
+          sendWeapon(p);
+        } else {
+          resolveShot(p, m.ang);
+        }
+        break;
+      }
+      case C2S.CHARGE:
+        // fire pressed on a charge weapon → start the server's charge clock (idempotent while held)
+        if (!p.dead) { const w = WEAPONS[p.weapon]; if (w && w.charge && !p.chargeStart) p.chargeStart = Date.now(); }
         break;
       case C2S.RELOAD: {
         const key = p.weapon;
         const wp = WEAPONS[key];
+        p.chargeStart = 0;                                    // reloading cancels a charge
         if (!p.dead && Date.now() >= p.reloadUntil && (p.clips[key] || 0) < wp.clip) {
           p.reloadUntil = Date.now() + wp.reloadMs;
           setTimeout(() => {
@@ -364,7 +411,7 @@ wss.on('connection', (ws) => {
         // switch to an OWNED weapon (ownership = a key in p.clips). Cancels a reload.
         const key = m.weapon;
         if (!p.dead && WEAPONS[key] && (key in p.clips) && key !== p.weapon) {
-          p.weapon = key; p.reloadUntil = 0;
+          p.weapon = key; p.reloadUntil = 0; p.chargeStart = 0;   // switching cancels a charge
           sendWeapon(p);
         }
         break;
