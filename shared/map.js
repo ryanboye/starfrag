@@ -156,6 +156,14 @@ export const ARENA = {
     { id: 'pickup-cryo-health', type: 'pickup', kind: 'health', x: 8,  y: 29 },  // SW corner
     { id: 'pickup-sub-armor',   type: 'pickup', kind: 'armor',  x: 23, y: 29 },  // behind the transformer
     { id: 'pickup-warren-health', type: 'pickup', kind: 'health', x: 1.5, y: 6 },// tucked in the warren
+
+    // === WEAPON PICKUPS: walk over one to grab + switch to it (server-authoritative).
+    // Placed to pull players across the map: the scattergun sits exposed in the
+    // north gallery under the planet window; the plasma repeater is out on the west
+    // conduit flank. (Add a { kind:'weapon', weapon:'railgun' } here once tinyclaw's
+    // railgun stats land in WEAPONS — the pickup/switch system grants it for free.)
+    { id: 'weapon-scatter', type: 'pickup', kind: 'weapon', weapon: 'scatter', x: 15.5, y: 3 },
+    { id: 'weapon-plasma',  type: 'pickup', kind: 'weapon', weapon: 'plasma',  x: 2.5,  y: 15.5 },
   ],
 };
 
@@ -212,6 +220,10 @@ export const HANGAR_BAY = {
     { id: 'pickup-baydoor-health', type: 'pickup', kind: 'health', x: 16, y: 4 },
     { id: 'pickup-w-armor', type: 'pickup', kind: 'armor', x: 3, y: 16 },
     { id: 'pickup-e-armor', type: 'pickup', kind: 'armor', x: 28, y: 16 },
+    // weapon pickups: scattergun beside the docked dropship (central risk), plasma
+    // out on the exposed east flank.
+    { id: 'weapon-scatter', type: 'pickup', kind: 'weapon', weapon: 'scatter', x: 16, y: 22.5 },
+    { id: 'weapon-plasma',  type: 'pickup', kind: 'weapon', weapon: 'plasma',  x: 28, y: 22 },
 
     // --- AIRLOCK OBJECTIVE (Seb): four consoles ringing the docked dropship,
     // each with a clear look north to the bay door. Capture all four to open the
@@ -275,7 +287,8 @@ export function compileMap(arena = ARENA) {
         spawns.push({ id: e.id, x: e.x, y: e.y, ang: e.ang || 0 });
         break;
       case 'pickup':
-        pickups.push({ id: e.id, kind: e.kind, x: e.x, y: e.y });
+        // weapon pickups carry a `weapon` key; health/armor carry only `kind`.
+        pickups.push({ id: e.id, kind: e.kind, x: e.x, y: e.y, weapon: e.weapon });
         break;
       // Airlock-objective entities. Consoles are floor devices (NOT put in the
       // grid — players stand on them to channel), the airlock is the vent region.

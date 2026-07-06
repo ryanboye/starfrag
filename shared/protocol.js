@@ -35,29 +35,75 @@ export const OBJECTIVE = {
   VENT_MS: 2500,       // the vent spectacle window (the kill lands at its start)
 };
 
-// The one and only weapon in the scaffold: the "PULSE CARBINE".
-// New weapons are added here + in the client viewmodel — see CONTRIBUTING.md.
+// The weapon roster. Stats are AUTHORITATIVE and shared: the server's resolveShot
+// reads pellets/spread/rateMs/clip/dmg/range straight from here, so a new key is
+// authoritative for free (see CONTRIBUTING.md → "How to add a weapon"). The client
+// reads the same table for its viewmodel, ammo HUD, bolt tint and SFX names.
+//
+// `slot`   — number-key / cycle order (1..N).
+// `color`  — HUD + pickup billboard + traveling-bolt tint.
+// `fireSfx`/`reloadSfx` — asset basenames in client/assets/sfx (playSfx by name).
 export const WEAPONS = {
   carbine: {
-    name: 'PULSE CARBINE',
+    name: 'PULSE CARBINE', slot: 1, color: '#3cd6ff',
     rateMs: 110,     // min ms between shots
     clip: 12,
     reloadMs: 1150,
     pellets: 1,
     spread: 0,       // radians of random cone per pellet
-    dmgLo: 18,
-    dmgHi: 30,
+    dmgLo: 18, dmgHi: 30,
     range: 40,
+    fireSfx: 'shoot', reloadSfx: 'reload',
   },
+  // RIOT SCATTERGUN — chunky close-range pump-action: a fat cone of pellets, slow
+  // to cycle, brutal up close and near-useless past mid-range. Video-pipeline
+  // fire + reload animation (sprite-forge kling img2vid → repaired frames).
+  scatter: {
+    name: 'RIOT SCATTERGUN', slot: 2, color: '#ff9a3c',
+    rateMs: 620,
+    clip: 6,
+    reloadMs: 1500,
+    pellets: 8,
+    spread: 0.135,
+    dmgLo: 6, dmgHi: 11,
+    range: 22,
+    fireSfx: 'scatter-fire', reloadSfx: 'scatter-reload',
+  },
+  // PLASMA REPEATER — fast projectile stream, ties into the traveling-bolt system.
+  // Tighter than the carbine but a hair of spread; bigger mag, mid reload.
+  plasma: {
+    name: 'PLASMA REPEATER', slot: 3, color: '#8cff5a',
+    rateMs: 165,
+    clip: 20,
+    reloadMs: 1300,
+    pellets: 1,
+    spread: 0.02,
+    dmgLo: 13, dmgHi: 21,
+    range: 38,
+    fireSfx: 'plasma-fire', reloadSfx: 'plasma-reload',
+  },
+  // slot 4 — RAILGUN reserved for tinyclaw. When its stats land here and a
+  // `{ kind:'weapon', weapon:'railgun' }` pickup is placed in a deck, the pickup +
+  // switch SYSTEM below grants/switches to it with ZERO extra wiring.
 };
 export const DEFAULT_WEAPON = 'carbine';
+// What every player spawns owning. Picked-up weapons are LOST on death (drop-on-death
+// arena rules), so the map pickups stay meaningful round to round.
+export const STARTING_WEAPONS = ['carbine'];
+// slot number -> weapon key (for number-key selection + cycle order)
+export const WEAPON_SLOTS = Object.fromEntries(
+  Object.entries(WEAPONS).map(([k, w]) => [w.slot, k]));
+// How long a grabbed weapon pickup stays gone before it respawns (ms).
+export const WEAPON_PICKUP_RESPAWN_MS = 12000;
+export const WEAPON_PICKUP_RADIUS = 0.75;   // cells — walk this close to grab it
 
 // Client -> Server
 export const C2S = {
   JOIN:   'join',    // { name }
   MOVE:   'move',    // { x, y, ang, moving }   client-authoritative position (scaffold)
-  SHOOT:  'shoot',   // { ang, weapon }         server does the authoritative hitscan
-  RELOAD: 'reload',  // { weapon }
+  SHOOT:  'shoot',   // { ang }                 server hitscans with the player's AUTHORITATIVE weapon
+  RELOAD: 'reload',  // { }                     reload the current weapon
+  SWITCH: 'switch',  // { weapon }              request a switch to an owned weapon
   PING:   'ping',    // { ts }
 };
 
@@ -66,6 +112,8 @@ export const S2C = {
   WELCOME: 'welcome', // { id, spawn:{x,y,ang}, mapName, players:[state...] }
   STATE:   'state',   // { players:[ {id,name,color,x,y,ang,hp,frags,dead,fireT,reloading} ] }
   SHOT:    'shot',    // { id, ang, weapon }   -> render a muzzle flash on player `id`
+  WEAPON:  'weapon',  // { weapon, clip, owned:[keys] }  -> YOUR authoritative weapon/ammo changed
+  PICKUP:  'pickup',  // { id, taken }         -> a map weapon-pickup became (un)available
   HIT:     'hit',     // { id, by, dmg, hp }   -> player `id` took damage from `by`
   KILL:    'kill',    // { id, by, weapon, names:{id,by} }  -> killfeed entry
   SPAWN:   'spawn',   // { id, x, y, ang }     -> player (re)spawned

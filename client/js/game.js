@@ -8,7 +8,7 @@
 // every art path falls back to procedural shading until its asset loads. The map,
 // the wire protocol and the hitscan math all come from ../shared so client and
 // server agree exactly.
-import { WEAPONS, DEFAULT_WEAPON, C2S, S2C, OBJECTIVE } from '../shared/protocol.js';
+import { WEAPONS, DEFAULT_WEAPON, WEAPON_SLOTS, C2S, S2C, OBJECTIVE } from '../shared/protocol.js';
 import { compileMap, raycast, isSolidCell, TEX, pickArena } from '../shared/map.js';
 import { Net } from './net.js';
 import { createBot } from './bot.js';
@@ -52,6 +52,11 @@ const me = {
   moving: 0, bobPhase: 0, strafeLean: 0,
   clip: WEAPONS[DEFAULT_WEAPON].clip, fireT: -1e9, reloadUntil: 0, wasReloading: false,
   dead: false, weapon: DEFAULT_WEAPON, id: null,
+  // per-weapon ammo mirror of the server loadout; `owned` = the ownership set.
+  // Updated authoritatively by S2C.WEAPON (pickup / switch / reload / respawn), and
+  // predicted locally between messages so the viewmodel + ammo HUD feel instant.
+  clips: { [DEFAULT_WEAPON]: WEAPONS[DEFAULT_WEAPON].clip },
+  owned: new Set([DEFAULT_WEAPON]),
 };
 const cam = { kickY: 0, kickX: 0, roll: 0, dmgFlash: 0, shake: 0, hitstop: 0,
   ventOffX: 0, ventOffY: 0, ventFlash: 0, door: 0, bodyPull: 0 };
@@ -62,6 +67,13 @@ const cross = { bloom: 0, hit: 0, kill: 0 };
 let started = IS_BOT;                          // bots skip the click-to-start gate
 const flashUntil = new Map();                 // playerId -> ms, remote muzzle flash
 const killfeed = [];                          // { text, until }
+
+// weapon pickups on the map. Positions come from the compiled deck; AVAILABILITY is
+// server-authoritative (seeded in welcome, toggled by S2C.PICKUP). The client only
+// renders the glowing pads and never decides a grab (server proximity owns that).
+const weaponSpots = world.pickups.filter((p) => p.kind === 'weapon');
+const pickupTaken = new Map();                 // pickup id -> true while grabbed (pad dark)
+let pickupToast = { text: '', until: 0 };      // brief "PICKED UP <NAME>" banner
 
 // ---------------------------------------------------------------- airlock objective (client render only)
 // PURELY COSMETIC. The server (S2C.OBJECTIVE, 20Hz) owns every truth — who owns a
@@ -161,16 +173,18 @@ function tickParticles(dt) {
   if (particles.length) particles = particles.filter((p) => p.life > 0);
 }
 
-// One traveling plasma bolt. `own` bolts (mine) glow cyan; incoming glow hot.
-function spawnBolt(x, y, ang, own) {
+// One traveling projectile. `own` bolts (mine) glow the weapon colour; incoming
+// glow hot. opts overrides colour/speed/life so a scattergun can fan out short-lived
+// orange pellets while the plasma/carbine fling one fast bolt.
+function spawnBolt(x, y, ang, own, opts = {}) {
   if (IS_BOT) return;
   if (bolts.length >= MAX_BOLTS) bolts.shift();
-  const BOLT_SPEED = 30;                            // world-units/sec — fast plasma, still visibly travels
+  const speed = opts.speed ?? 30;                   // world-units/sec — fast plasma, still visibly travels
   bolts.push({
     x: x + Math.cos(ang) * 0.35, y: y + Math.sin(ang) * 0.35,
-    dx: Math.cos(ang) * BOLT_SPEED, dy: Math.sin(ang) * BOLT_SPEED,
-    life: 1.4, own,
-    r: own ? 120 : 255, g: own ? 235 : 150, b: own ? 255 : 90,
+    dx: Math.cos(ang) * speed, dy: Math.sin(ang) * speed,
+    life: opts.life ?? 1.4, own,
+    r: opts.r ?? (own ? 120 : 255), g: opts.g ?? (own ? 235 : 150), b: opts.b ?? (own ? 255 : 90),
   });
 }
 function tickBolts(dt) {
@@ -284,6 +298,52 @@ const WALLTEX = {
 const deckTex = loadWallTex(ART_DIR + 'floor_deck.png');
 let gunSprite = null;
 loadSprite(ART_DIR + 'carbine.png', (s) => { gunSprite = s; });
+
+// --- animated weapon viewmodels (sprite-forge VIDEO→FRAMES pipeline) ----------
+// The scattergun + plasma repeater are square POV frames authored on #FF00FF (hero
+// still, plus FIRE and RELOAD strips extracted from a kling img2vid and repaired).
+// Unlike the carbine sprite they are loaded UNCROPPED — every frame shares one 512²
+// space so the animation never jitters — and chroma-keyed with the SAME keyer, in a
+// canvas we can drawImage. `meta` tunes how big/low each viewmodel sits + where its
+// muzzle is (flash overlay). Frames that don't exist yet just never load (hero-only).
+function loadFrame(src, cb) {
+  const im = new Image();
+  im.onload = () => {
+    const W = im.naturalWidth, H = im.naturalHeight;
+    const c = document.createElement('canvas'); c.width = W; c.height = H;
+    const g = c.getContext('2d'); g.drawImage(im, 0, 0);
+    const id = g.getImageData(0, 0, W, H), d = id.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const r = d[i], gg = d[i + 1], b = d[i + 2];
+      const m = Math.min(r, b) - gg;
+      if (m > 52) { d[i + 3] = 0; continue; }
+      if (m > 18) { const k = (m - 18) * 0.8; d[i] = Math.max(0, r - k) | 0; d[i + 2] = Math.max(0, b - k) | 0; }
+    }
+    g.putImageData(id, 0, 0);
+    cb({ canvas: c, w: W, h: H });
+  };
+  im.onerror = () => {};   // frame not generated (yet) — hero-only weapon still works
+  im.src = src;
+}
+const WEAPON_ART = {
+  // Square POV frames. `topFrac` = where the visible weapon's TOP (barrel tip) sits
+  // within the square, measured from the top (heroes: scatter barrels ~0.24 down,
+  // plasma barrel ~0.15 down). drawGun sizes each frame so that barrel tip lands at
+  // a fixed low screen line — the gun stays in the BOTTOM ~46% of the view and never
+  // balloons on wide-short (mobile-landscape) aspects. See GUN_TOP_Y in drawGun.
+  scatter: { hero: null, fire: [], reload: [], meta: { topFrac: 0.24 } },
+  plasma:  { hero: null, fire: [], reload: [], meta: { topFrac: 0.15 } },
+};
+function loadWeaponArt(key, counts = {}) {
+  const art = WEAPON_ART[key]; if (!art) return;
+  loadFrame(`${ART_DIR}${key}/hero.png`, (f) => { art.hero = f; });
+  for (const [kind, n] of Object.entries(counts)) {
+    art[kind] = new Array(n).fill(null);
+    for (let i = 0; i < n; i++) loadFrame(`${ART_DIR}${key}/${kind}/f${i}.png`, (f) => { art[kind][i] = f; });
+  }
+}
+loadWeaponArt('scatter', { reload: 8, fire: 5 });
+loadWeaponArt('plasma',  { reload: 8, fire: 5 });
 
 // 8-way directional enemy billboards (Doom/Build-engine style). Index = the VIEW
 // the camera sees, going around the compass from S(front) counter-clockwise:
@@ -701,63 +761,157 @@ function render(t) {
     }
   }
 
+  // --- WEAPON PICKUPS: glowing floating pads (available ones only) ---
+  // World billboards in the weapon's colour: a hovering additive diamond + a bright
+  // ground marker, depth-tested against the walls so they hide behind cover.
+  for (const pk of weaponSpots) {
+    if (pickupTaken.get(pk.id)) continue;
+    const wpc = WEAPONS[pk.weapon]; if (!wpc) continue;
+    const relX = pk.x - ex, relY = pk.y - ey;
+    const ptx = invDet * (dirY * relX - dirX * relY);
+    const pty = invDet * (-planeY * relX + planeX * relY);
+    if (pty <= 0.25 || pty > 36) continue;
+    const sx = (SCREEN_W / 2) * (1 + ptx / pty);
+    const ccol = Math.round(sx);
+    if (ccol < 0 || ccol >= SCREEN_W || pty >= zbuf[ccol]) continue;
+    const floorY = HORIZON + (0.5 * PROJ) / pty;
+    const bob = Math.sin(t * 2.2 + pk.x * 1.7) * 0.1;              // hover
+    const cy = HORIZON + ((0.5 - (0.34 + bob)) * PROJ) / pty;      // float above the deck
+    const rad = Math.max(2, ((0.5 * PROJ) / pty) * 0.42);
+    const col = hexRGB(wpc.color);
+    const pulse = 0.65 + 0.35 * Math.sin(t * 5 + pk.x);
+    const rh = rad * 1.7;
+    for (let yy = -rh; yy <= rh; yy++) {
+      const Y = (cy + yy) | 0; if (Y < 0 || Y >= SCREEN_H) continue;
+      for (let xx = -rad; xx <= rad; xx++) {
+        const X = (sx + xx) | 0; if (X < 0 || X >= SCREEN_W) continue;
+        if (pty >= zbuf[X]) continue;
+        const dn = Math.abs(xx) / rad + Math.abs(yy) / rh;         // diamond mask
+        if (dn > 1) continue;
+        const f = 1 - dn, core = dn < 0.32 ? 1 : 0;
+        const i = Y * SCREEN_W + X, px = fb[i];
+        const ar = Math.min(255, col[0] * f * pulse + core * 150);
+        const ag = Math.min(255, col[1] * f * pulse + core * 150);
+        const ab = Math.min(255, col[2] * f * pulse + core * 150);
+        fb[i] = packRGB(Math.min(255, (px & 255) + ar) | 0, Math.min(255, ((px >> 8) & 255) + ag) | 0, Math.min(255, ((px >> 16) & 255) + ab) | 0);
+      }
+    }
+    // bright ground marker so you can spot the pad on the floor
+    const gy = floorY | 0;
+    for (let xx = -rad; xx <= rad; xx++) {
+      const X = (sx + xx) | 0; if (X < 0 || X >= SCREEN_W || gy < 0 || gy >= SCREEN_H) continue;
+      if (pty >= zbuf[X]) continue;
+      const i = gy * SCREEN_W + X, px = fb[i];
+      fb[i] = packRGB(Math.min(255, (px & 255) + col[0] * 0.45) | 0, Math.min(255, ((px >> 8) & 255) + col[1] * 0.45) | 0, Math.min(255, ((px >> 16) & 255) + col[2] * 0.45) | 0);
+    }
+  }
+
   octx.putImageData(img, 0, 0);
 }
 
 function hexRGB(h) { const n = parseInt(h.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
 
 // ---------------------------------------------------------------- weapon viewmodel
+// Two paths: the CARBINE draws its single cropped POV sprite (+ procedural reload
+// dip); the SCATTERGUN + PLASMA draw video-derived frame strips (sprite-forge kling
+// pipeline) — reload frames win over fire frames, and the real motion carries the
+// animation so the procedural dip is suppressed. Muzzle flash is always a separate
+// additive overlay, tinted per weapon, never baked into the frame.
 function drawGun(ctx, t) {
   const wp = WEAPONS[me.weapon];
+  const art = WEAPON_ART[me.weapon];
   const bobA = me.moving;
   const bx = Math.sin(me.bobPhase) * 6 * bobA - me.strafeLean * 6;
   const by = (1 - Math.cos(me.bobPhase * 2)) * 3 * bobA;
   const kick = vm.kick * 10;
-  let dip = 0, roll = 0;
-  const rem = me.reloadUntil - performance.now();
-  if (rem > 0) { const k = 1 - rem / wp.reloadMs; dip = Math.sin(k * Math.PI) * 46; roll = Math.sin(k * Math.PI) * 0.25; }
+  const nowMs = performance.now();
+  const rem = me.reloadUntil - nowMs;
+  const fireMs = Math.min(wp.rateMs * 0.7, 360);   // how long the fire strip plays
+
+  let frame = null, dip = 0, roll = 0;
+  const hasReload = art && art.reload.some(Boolean);
+  const hasFire = art && art.fire.some(Boolean);
+  if (art && art.hero) {
+    if (rem > 0 && hasReload) {
+      const k = 1 - rem / wp.reloadMs;                                  // 0..1 through the reload
+      frame = art.reload[Math.min(art.reload.length - 1, (k * art.reload.length) | 0)] || art.hero;
+    } else if (hasFire && (nowMs - me.fireT) < fireMs) {
+      const k = (nowMs - me.fireT) / fireMs;                            // 0..1 through the shot
+      frame = art.fire[Math.min(art.fire.length - 1, (k * art.fire.length) | 0)] || art.hero;
+    } else {
+      frame = art.hero;
+      if (rem > 0) { const k = 1 - rem / wp.reloadMs; dip = Math.sin(k * Math.PI) * 40; } // no reload frames -> procedural dip
+    }
+  } else if (rem > 0) {
+    // carbine (or art still loading): classic procedural reload dip + roll
+    const k = 1 - rem / wp.reloadMs; dip = Math.sin(k * Math.PI) * 46; roll = Math.sin(k * Math.PI) * 0.25;
+  }
 
   const cx = SCREEN_W / 2 + bx + cam.kickX * 0.4;
-  const baseY = SCREEN_H + 26 + kick + dip + by + cam.kickY * 0.3;  // sit lower (awfml: was hogging the screen)
+  let muzzleY = SCREEN_H - 120;
+  // HARD SIZING RULE (awfml QA gate, flagged twice): the viewmodel must sit LOW and
+  // never cover the crosshair or the upper view — critical on wide-short mobile
+  // landscape. The visible barrel tip lands on GUN_TOP_Y (~54% down); the gun fills
+  // only the bottom ~46% of the FIXED 384x240 framebuffer, so object-fit:contain
+  // keeps it out of the way on every aspect ratio.
+  const GUN_TOP_Y = SCREEN_H * 0.54;
 
-  let muzzleY = baseY - 120;   // procedural fallback muzzle height
-  ctx.save();
-  ctx.translate(cx, baseY);
-  ctx.rotate(roll);
-  if (gunSprite) {
-    // real POV pulse carbine (sprite-forge / gpt-image-2), anchored bottom-centre
-    const gw = SCREEN_W * 0.54;   // was 0.7 — smaller so it doesn't block the view
-    const gh = gw * (gunSprite.h / gunSprite.w);
+  if (frame) {
+    // video-derived square frame: size so the barrel tip (meta.topFrac down the
+    // square) sits at GUN_TOP_Y, anchored to just below the screen bottom.
+    const meta = art.meta;
+    const frameBottom = SCREEN_H + 8 + kick + dip + by + cam.kickY * 0.3;
+    const gh = (frameBottom - GUN_TOP_Y) / (1 - meta.topFrac), gw = gh;   // square
+    ctx.save();
+    ctx.translate(cx, frameBottom);
+    ctx.rotate(roll);
     ctx.imageSmoothingEnabled = true;
-    ctx.drawImage(gunSprite.canvas, -gw / 2, -gh, gw, gh);
-    muzzleY = baseY - gh * 0.96;   // flash at the foreshortened barrel tip
+    ctx.drawImage(frame.canvas, -gw / 2, -gh, gw, gh);
+    ctx.restore();
+    muzzleY = frameBottom - gh * (1 - meta.topFrac);   // barrel tip == GUN_TOP_Y
   } else {
-    // procedural fallback (draws until the sprite loads)
-    ctx.fillStyle = '#20242c'; ctx.fillRect(-34, -46, 68, 60);
-    ctx.fillStyle = '#2c323c'; ctx.fillRect(-30, -70, 60, 30);
-    ctx.fillStyle = '#171a20'; ctx.fillRect(-12, -118, 24, 60);   // barrel/receiver up to muzzle
-    ctx.fillStyle = '#3a4450'; ctx.fillRect(-8, -116, 16, 10);    // barrel shroud band
-    // energy cell (glowing)
-    ctx.fillStyle = '#0a3a44'; ctx.fillRect(-26, -40, 10, 34);
-    ctx.fillStyle = me.clip > 0 ? '#3cd6ff' : '#ff3c4a';
-    ctx.fillRect(-24, -38 + 30 * (1 - me.clip / wp.clip), 6, 30 * (me.clip / wp.clip) + 1);
-    // sight
-    ctx.fillStyle = '#3a4450'; ctx.fillRect(-3, -128, 6, 12);
+    const baseY = SCREEN_H + 6 + kick + dip + by + cam.kickY * 0.3;
+    ctx.save();
+    ctx.translate(cx, baseY);
+    ctx.rotate(roll);
+    if (gunSprite && me.weapon === 'carbine') {
+      // real POV pulse carbine — width-derived, but HEIGHT-CAPPED so it never
+      // exceeds the bottom ~46% band (mobile-landscape safe).
+      let gw = SCREEN_W * 0.5, gh = gw * (gunSprite.h / gunSprite.w);
+      const maxH = baseY - GUN_TOP_Y;
+      if (gh > maxH) { gh = maxH; gw = gh * (gunSprite.w / gunSprite.h); }
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(gunSprite.canvas, -gw / 2, -gh, gw, gh);
+      muzzleY = baseY - gh * 0.96;   // flash at the foreshortened barrel tip
+    } else {
+      // procedural fallback (draws until a sprite loads)
+      ctx.fillStyle = '#20242c'; ctx.fillRect(-34, -46, 68, 60);
+      ctx.fillStyle = '#2c323c'; ctx.fillRect(-30, -70, 60, 30);
+      ctx.fillStyle = '#171a20'; ctx.fillRect(-12, -118, 24, 60);   // barrel/receiver up to muzzle
+      ctx.fillStyle = '#3a4450'; ctx.fillRect(-8, -116, 16, 10);    // barrel shroud band
+      ctx.fillStyle = '#0a3a44'; ctx.fillRect(-26, -40, 10, 34);
+      ctx.fillStyle = me.clip > 0 ? '#3cd6ff' : '#ff3c4a';
+      ctx.fillRect(-24, -38 + 30 * (1 - me.clip / wp.clip), 6, 30 * (me.clip / wp.clip) + 1);
+      ctx.fillStyle = '#3a4450'; ctx.fillRect(-3, -128, 6, 12);
+      muzzleY = baseY - 120;
+    }
+    ctx.restore();
   }
-  ctx.restore();
 
-  // muzzle flash — separate additive overlay, fired via vm.flash (never baked in)
+  // muzzle flash — separate additive overlay, fired via vm.flash (never baked in),
+  // tinted to the weapon's colour and beefier for the scattergun.
   if (vm.flash > 0.35) {
-    const mx = cx, my = muzzleY;
+    const c = hexRGB(wp.color || '#ffd28c');
+    const big = me.weapon === 'scatter' ? 1.7 : me.weapon === 'plasma' ? 1.15 : 1;
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
-    ctx.translate(mx, my);
+    ctx.translate(cx, muzzleY);
     ctx.rotate(Math.random() * 6.28);
-    const s = 26 + Math.random() * 16;
+    const s = (26 + Math.random() * 16) * big;
     const grd = ctx.createRadialGradient(0, 0, 0, 0, 0, s);
-    grd.addColorStop(0, 'rgba(255,245,200,0.95)');
-    grd.addColorStop(0.5, 'rgba(255,180,90,0.7)');
-    grd.addColorStop(1, 'rgba(255,120,40,0)');
+    grd.addColorStop(0, 'rgba(255,250,232,0.95)');
+    grd.addColorStop(0.5, `rgba(${c[0]},${c[1]},${c[2]},0.72)`);
+    grd.addColorStop(1, `rgba(${c[0]},${c[1]},${c[2]},0)`);
     ctx.fillStyle = grd;
     ctx.beginPath();
     for (let i = 0; i < 8; i++) { const a = i / 8 * 6.28, r = i % 2 ? s : s * 0.4; ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r); }
@@ -783,17 +937,29 @@ function fire() {
   const wp = WEAPONS[me.weapon], nowMs = performance.now();
   if (me.dead || nowMs - me.fireT < wp.rateMs || nowMs < me.reloadUntil) return;
   if (me.clip <= 0) { startReload(); return; }
-  me.clip--; me.fireT = nowMs;
-  // punchy recoil: viewmodel snap + view kicks up-and-slightly-sideways + a
-  // touch of roll, and the crosshair blooms open (tightens back as it decays).
+  me.clip--; me.clips[me.weapon] = me.clip; me.fireT = nowMs;
+  // punchy recoil: viewmodel snap + view kicks up-and-slightly-sideways + a touch of
+  // roll, crosshair blooms open. The scattergun hits noticeably harder + shakes.
+  const heavy = me.weapon === 'scatter';
   vm.flash = 1; vm.kick = 1;
-  cam.kickY += 5.5;
-  cam.kickX += (Math.random() - 0.5) * 3.2;
-  cam.roll += (Math.random() - 0.5) * 0.016;
-  cross.bloom = Math.min(1.4, cross.bloom + 0.9);
-  spawnBolt(me.x, me.y, me.ang, true);       // my plasma bolt (client-visual v1)
-  playSfx('shoot');
-  playSfx('whoosh', 0.22);                     // plasma launch layer, under the report
+  cam.kickY += heavy ? 8.5 : 5.5;
+  cam.kickX += (Math.random() - 0.5) * (heavy ? 4.6 : 3.2);
+  cam.roll += (Math.random() - 0.5) * (heavy ? 0.03 : 0.016);
+  cross.bloom = Math.min(1.7, cross.bloom + (heavy ? 1.5 : 0.9));
+  if (heavy) cam.shake = Math.max(cam.shake, 2.6);
+  // per-weapon projectile visuals (client-visual v1; the server hitscan is the truth):
+  // a scattergun fans out short orange pellets, everything else flings one fast bolt.
+  const c = hexRGB(wp.color);
+  if (wp.pellets > 1) {
+    for (let i = 0; i < wp.pellets; i++) {
+      const a = me.ang + (Math.random() - 0.5) * 2 * wp.spread;
+      spawnBolt(me.x, me.y, a, true, { speed: 26, life: 0.5, r: c[0], g: c[1], b: c[2] });
+    }
+  } else {
+    spawnBolt(me.x, me.y, me.ang, true, { speed: 32, r: c[0], g: c[1], b: c[2] });
+    playSfx('whoosh', 0.22);                  // plasma/carbine launch layer, under the report
+  }
+  playSfx(wp.fireSfx || 'shoot');
   Net.shoot(me.ang, me.weapon);
   window.PlaytestLink && PlaytestLink.event('shot', { clip: me.clip, weapon: me.weapon });
 }
@@ -801,9 +967,25 @@ function startReload() {
   const wp = WEAPONS[me.weapon], nowMs = performance.now();
   if (me.dead || nowMs < me.reloadUntil || me.clip >= wp.clip) return;
   me.reloadUntil = nowMs + wp.reloadMs; me.wasReloading = true;
-  playSfx('reload');
+  playSfx(wp.reloadSfx || 'reload');
   Net.reload(me.weapon);
-  window.PlaytestLink && PlaytestLink.event('reload', {});
+  window.PlaytestLink && PlaytestLink.event('reload', { weapon: me.weapon });
+}
+// Switch to an OWNED weapon (number keys / scroll / touch). Predict locally for an
+// instant viewmodel swap; the server confirms via S2C.WEAPON. Switching cancels a reload.
+function switchWeapon(key) {
+  if (me.dead || key === me.weapon || !me.owned.has(key) || !WEAPONS[key]) return;
+  me.weapon = key;
+  me.clip = me.clips[key] ?? WEAPONS[key].clip; me.clips[key] = me.clip;
+  me.reloadUntil = 0; me.wasReloading = false;
+  playSfx('switch', 0.4);
+  Net.switchWeapon(key);
+}
+function cycleWeapon(dir) {
+  const owned = Object.values(WEAPON_SLOTS).filter((k) => me.owned.has(k));   // slot order
+  if (owned.length < 2) return;
+  const i = owned.indexOf(me.weapon);
+  switchWeapon(owned[(i + dir + owned.length) % owned.length]);
 }
 
 // ---------------------------------------------------------------- audio
@@ -831,7 +1013,24 @@ Net.onWelcome = (m) => {
   document.getElementById('arena').textContent = 'STARFRAG · ' + m.mapName;
   // render the objective immediately from the welcome snapshot (null on deathmatch)
   if (m.objective) { objState = m.objective; prevObj = m.objective; }
+  // seed weapon-pickup availability (server truth)
+  if (m.pickups) for (const pk of m.pickups) pickupTaken.set(pk.id, !!pk.taken);
 };
+// authoritative loadout: pickup grant / switch confirm / reload complete / respawn.
+// Sync the predicted mirror; a NEW weapon (owned grew) pops a pickup toast + swap sfx.
+Net.on(S2C.WEAPON, (m) => {
+  const grew = m.owned && m.owned.some((k) => !me.owned.has(k));
+  if (m.owned) me.owned = new Set(m.owned);
+  me.weapon = m.weapon;
+  if (Number.isFinite(m.clip)) { me.clip = m.clip; me.clips[m.weapon] = m.clip; }
+  me.reloadUntil = 0; me.wasReloading = false;
+  if (grew) {
+    pickupToast = { text: 'PICKED UP ' + (WEAPONS[m.weapon]?.name || m.weapon), until: performance.now() + 1800 };
+    playSfx('switch', 0.5);
+  }
+});
+// a map weapon-pickup became (un)available — toggle its pad
+Net.on(S2C.PICKUP, (m) => { pickupTaken.set(m.id, !!m.taken); });
 // server-authoritative objective state @20Hz — render only, decide nothing
 Net.on(S2C.OBJECTIVE, onObjective);
 Net.on(S2C.SHOT, (m) => {
@@ -893,7 +1092,14 @@ Net.on(S2C.KILL, (m) => {
   if (m.id === me.id) { playSfx('death'); window.PlaytestLink && PlaytestLink.event('death', { by: m.by }); }
 });
 Net.on(S2C.SPAWN, (m) => {
-  if (m.id === me.id) { me.x = m.x; me.y = m.y; me.ang = m.ang; me.dead = false; me.clip = WEAPONS[me.weapon].clip; playSfx('spawn'); }
+  if (m.id === me.id) {
+    me.x = m.x; me.y = m.y; me.ang = m.ang; me.dead = false;
+    // respawn drops picked-up weapons back to the carbine (server does the same);
+    // the S2C.WEAPON that follows confirms it.
+    me.weapon = DEFAULT_WEAPON; me.owned = new Set([DEFAULT_WEAPON]);
+    me.clips = { [DEFAULT_WEAPON]: WEAPONS[DEFAULT_WEAPON].clip }; me.clip = me.clips[DEFAULT_WEAPON];
+    playSfx('spawn');
+  }
 });
 
 // ---------------------------------------------------------------- input
@@ -908,8 +1114,13 @@ if (!IS_BOT) {
     if (window.PlaytestLink && (e.code === 'KeyT' || e.code === 'KeyM')) return; // owned by playtest-link
     keys[e.code] = true;
     if (e.code === 'KeyR') startReload();
+    // weapon switch: number keys pick a slot directly, Q cycles owned weapons
+    const dm = /^Digit([1-9])$/.exec(e.code);
+    if (dm) { const k = WEAPON_SLOTS[+dm[1]]; if (k) switchWeapon(k); }
+    if (e.code === 'KeyQ') cycleWeapon(1);
   });
   addEventListener('keyup', (e) => { keys[e.code] = false; });
+  addEventListener('wheel', (e) => { if (started && !me.dead) cycleWeapon(e.deltaY > 0 ? 1 : -1); }, { passive: true });
   screen.addEventListener('click', () => { if (started && !document.pointerLockElement) screen.requestPointerLock?.(); });
   addEventListener('mousemove', (e) => { if (document.pointerLockElement === screen) me.ang += e.movementX * 0.0032; });
   addEventListener('mousedown', () => { if (document.pointerLockElement === screen) fireHeld = true; });
@@ -952,8 +1163,8 @@ function frame(now) {
   const mine = Net.players.get(me.id);
   if (mine) { me.dead = mine.dead; me._hp = mine.hp; me._frags = mine.frags; }
 
-  // reload completion
-  if (me.wasReloading && performance.now() >= me.reloadUntil) { me.clip = WEAPONS[me.weapon].clip; me.wasReloading = false; }
+  // reload completion (predicted; server also confirms via S2C.WEAPON)
+  if (me.wasReloading && performance.now() >= me.reloadUntil) { me.clip = WEAPONS[me.weapon].clip; me.clips[me.weapon] = me.clip; me.wasReloading = false; }
 
   // KILL HITSTOP: for one beat the local sim holds its breath so a frag lands
   // with weight. Networking + rendering keep running; only input/movement/decay
@@ -1090,6 +1301,14 @@ function updateHUD() {
   bar.style.width = Math.max(0, hp) + '%';
   bar.style.background = hp > 55 ? '#ffb03a' : hp > 25 ? '#ff7a1a' : '#ff3c4a';
   $('ammo').textContent = me.dead ? '—' : me.clip;
+  // weapon name (weapon-coloured); briefly flashes the "PICKED UP …" toast on a grab
+  const wp = WEAPONS[me.weapon] || WEAPONS[DEFAULT_WEAPON];
+  const wEl = $('weapon');
+  if (wEl) {
+    const toast = pickupToast.until > performance.now();
+    wEl.textContent = toast ? pickupToast.text : (me.dead ? '' : wp.name);
+    wEl.style.color = wp.color || '';
+  }
   $('dmgflash').style.opacity = cam.dmgFlash * 0.7;
   $('status').textContent = me.dead ? 'RESPAWNING…' : (Net.connected ? '' : 'reconnecting…');
 
@@ -1161,9 +1380,15 @@ window.__game = {
   get objective() { return objState; },             // QA: server objective snapshot (null on deathmatch)
   get door() { return cam.door; },                  // QA: bay-door crank 0..1
   get ventPull() { return [+cam.ventOffX.toFixed(3), +cam.ventOffY.toFixed(3)]; }, // QA: render-only vent camera offset
+  get weapon() { return me.weapon; },               // QA: current authoritative weapon key
+  get owned() { return [...me.owned]; },             // QA: owned weapon keys
+  get reloading() { return me.reloadUntil > performance.now(); },
+  pickups() { return weaponSpots.map((p) => ({ id: p.id, weapon: p.weapon, taken: !!pickupTaken.get(p.id) })); },
   teleport(x, y, ang) { me.x = x; me.y = y; if (ang !== undefined) me.ang = ang; },
   setPos(x, y, ang) { this.teleport(x, y, ang); },
   fire() { me.fireT = -1e9; fire(); },
+  reload() { startReload(); },                       // QA: trigger a reload
+  switchWeapon(k) { switchWeapon(k); },              // QA: request a switch
   start() { started = true; const o = document.getElementById('overlay'); if (o) o.classList.add('hide'); }, // QA: enter without a click
 };
 
@@ -1252,6 +1477,9 @@ if (window.PlaytestLink) try {
     #tc .mark   { right:calc(env(safe-area-inset-right) + 116px);
       bottom:calc(env(safe-area-inset-bottom) + 98px); background:rgba(255,176,58,.14);
       border:2px solid #ffb03a; color:#ffe0b0; }
+    #tc .wpn    { right:calc(env(safe-area-inset-right) + 18px);
+      bottom:calc(env(safe-area-inset-bottom) + 116px); background:rgba(140,255,90,.14);
+      border:2px solid #8cff5a; color:#d6ffbf; }
     /* lift the bottom-right ammo readout clear of the thumb cluster (touch only) */
     body.touch #ammowrap { bottom:calc(env(safe-area-inset-bottom) + 178px); right:20px; }
   `;
@@ -1261,7 +1489,8 @@ if (window.PlaytestLink) try {
   const tc = mk('', ''); tc.id = 'tc';
   const stick = mk('stick'), knob = mk('knob'); stick.appendChild(knob); tc.appendChild(stick);
   const fireBtn = mk('btn fire', 'FIRE'), reloadBtn = mk('btn reload', 'RLD'), markBtn = mk('btn mark', 'MARK');
-  tc.append(fireBtn, reloadBtn, markBtn);
+  const wpnBtn = mk('btn wpn', 'WPN');
+  tc.append(fireBtn, reloadBtn, markBtn, wpnBtn);
   document.body.appendChild(tc);
 
   // buttons own their touches — they never drive look/move
@@ -1276,6 +1505,7 @@ if (window.PlaytestLink) try {
   btn(fireBtn, () => { touchFireHeld = true; }, () => { touchFireHeld = false; });
   btn(reloadBtn, () => startReload());
   btn(markBtn, () => { window.PlaytestLink && PlaytestLink.mark(); });
+  btn(wpnBtn, () => cycleWeapon(1));   // cycle owned weapons
 
   // field: simultaneous move (left half) + look (right half), tracked per touch id
   const STICK_R = 46, TAP_PX = 12, LOOK = 0.006;

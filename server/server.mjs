@@ -20,7 +20,8 @@
 import { WebSocketServer } from 'ws';
 import {
   C2S, S2C, TICK_HZ, RESPAWN_MS, PLAYER_HP, HIT_RADIUS,
-  WEAPONS, DEFAULT_WEAPON, PLAYER_COLORS, PROTOCOL_VERSION, OBJECTIVE,
+  WEAPONS, DEFAULT_WEAPON, STARTING_WEAPONS, WEAPON_PICKUP_RESPAWN_MS,
+  WEAPON_PICKUP_RADIUS, PLAYER_COLORS, PROTOCOL_VERSION, OBJECTIVE,
 } from '../shared/protocol.js';
 import { compileMap, raycast, pickArena } from '../shared/map.js';
 
@@ -43,19 +44,47 @@ function pickSpawn() {
   return { x: s.x, y: s.y, ang: s.ang };
 }
 
+// Per-player weapon loadout: `weapon` is the CURRENT key, `clips` maps every
+// OWNED weapon -> its remaining magazine (its keys are the ownership set). Reset to
+// the starting loadout with freshLoadout() on spawn (drop-on-death arena rules).
+function freshLoadout() {
+  const clips = {};
+  for (const k of STARTING_WEAPONS) clips[k] = WEAPONS[k].clip;
+  return { weapon: DEFAULT_WEAPON, clips };
+}
 function makePlayer(ws) {
   const id = nextId++;
   const color = PLAYER_COLORS[colorIx++ % PLAYER_COLORS.length];
   const spawn = pickSpawn();
+  const lo = freshLoadout();
   return {
     id, ws, color, name: `player${id}`,
     x: spawn.x, y: spawn.y, ang: spawn.ang,
     hp: PLAYER_HP, frags: 0, dead: false,
     moving: 0,
-    clip: WEAPONS[DEFAULT_WEAPON].clip,
+    weapon: lo.weapon, clips: lo.clips,   // current weapon + per-weapon ammo
     lastShot: 0, reloadUntil: 0, respawnAt: 0, fireT: 1e9,
     joined: false,
   };
+}
+
+// Tell one player their authoritative weapon/ammo (after a pickup, switch, reload
+// complete, or respawn). The client mirrors this onto its predicted viewmodel.
+function sendWeapon(p) {
+  send(p, {
+    t: S2C.WEAPON, weapon: p.weapon,
+    clip: p.clips[p.weapon] ?? 0, owned: Object.keys(p.clips),
+  });
+}
+
+// Grant a weapon: add it to the loadout (topped-off mag) and, by default, switch to
+// it. Guarded so an unknown key (e.g. a railgun pickup before its stats land) no-ops.
+function giveWeapon(p, key, { switchTo = true } = {}) {
+  const wp = WEAPONS[key];
+  if (!wp) return false;
+  p.clips[key] = wp.clip;                 // full mag on pickup
+  if (switchTo) { p.weapon = key; p.reloadUntil = 0; }   // switching cancels a reload
+  return true;
 }
 
 // public view of a player (what everybody else is allowed to see)
@@ -80,9 +109,10 @@ function respawn(p) {
   const spawn = pickSpawn();
   p.x = spawn.x; p.y = spawn.y; p.ang = spawn.ang;
   p.hp = PLAYER_HP; p.dead = false;
-  p.clip = WEAPONS[DEFAULT_WEAPON].clip;
+  const lo = freshLoadout(); p.weapon = lo.weapon; p.clips = lo.clips;   // drop picked-up weapons
   p.reloadUntil = 0; p.respawnAt = 0;
   broadcast({ t: S2C.SPAWN, id: p.id, x: p.x, y: p.y, ang: p.ang });
+  sendWeapon(p);   // reset the client viewmodel to the carbine
 }
 
 // --- AIRLOCK OBJECTIVE: server-authoritative capture-point win mode ---------
@@ -105,6 +135,40 @@ const OBJ = map.airlock ? {
 } : null;
 
 function objDist2(p, c) { const dx = p.x - c.x, dy = p.y - c.y; return dx * dx + dy * dy; }
+
+// --- WEAPON PICKUPS: server-authoritative grab + respawn --------------------
+// One state record per `{ kind:'weapon' }` entity in the compiled deck. A live
+// player who walks within WEAPON_PICKUP_RADIUS grabs it (giveWeapon + switch),
+// the pad goes dark for WEAPON_PICKUP_RESPAWN_MS, then respawns. Availability is
+// pushed to clients as edge events (S2C.PICKUP) + seeded in the welcome snapshot.
+const weaponPickups = map.pickups
+  .filter((pk) => pk.kind === 'weapon' && WEAPONS[pk.weapon])
+  .map((pk) => ({ id: pk.id, x: pk.x, y: pk.y, weapon: pk.weapon, taken: false, respawnAt: 0 }));
+const WPICK_R2 = WEAPON_PICKUP_RADIUS * WEAPON_PICKUP_RADIUS;
+
+function pickupsView() {
+  return weaponPickups.map((pk) => ({ id: pk.id, weapon: pk.weapon, taken: pk.taken }));
+}
+
+function updatePickups(now) {
+  for (const pk of weaponPickups) {
+    if (pk.taken) {
+      if (now >= pk.respawnAt) { pk.taken = false; broadcast({ t: S2C.PICKUP, id: pk.id, taken: false }); }
+      continue;
+    }
+    for (const p of players.values()) {
+      if (!p.joined || p.dead) continue;
+      const dx = p.x - pk.x, dy = p.y - pk.y;
+      if (dx * dx + dy * dy > WPICK_R2) continue;
+      if (p.weapon === pk.weapon && (p.clips[pk.weapon] || 0) >= WEAPONS[pk.weapon].clip) continue; // already holding it full
+      giveWeapon(p, pk.weapon, { switchTo: true });
+      sendWeapon(p);
+      pk.taken = true; pk.respawnAt = now + WEAPON_PICKUP_RESPAWN_MS;
+      broadcast({ t: S2C.PICKUP, id: pk.id, taken: true });
+      break;   // one grab per pad per tick
+    }
+  }
+}
 
 // Public objective snapshot for the wire — the client renders exactly this.
 function objectiveView(now) {
@@ -190,16 +254,19 @@ function updateObjective(now) {
 
 // Authoritative hitscan: fire one ray per pellet from the shooter, stop at the
 // first wall, and hit the nearest player body the ray passes within HIT_RADIUS.
-function resolveShot(shooter, ang, weaponKey) {
+// The weapon is the shooter's AUTHORITATIVE current weapon (the client can't spoof
+// which gun it's holding — only the server decides that from pickups/switches).
+function resolveShot(shooter, ang) {
+  const weaponKey = shooter.weapon;
   const wp = WEAPONS[weaponKey] || WEAPONS[DEFAULT_WEAPON];
   const now = Date.now();
 
   // fire-rate + ammo gates (authoritative)
   if (now - shooter.lastShot < wp.rateMs) return;
   if (now < shooter.reloadUntil) return;
-  if (shooter.clip <= 0) return;
+  if ((shooter.clips[weaponKey] || 0) <= 0) return;
   shooter.lastShot = now;
-  shooter.clip--;
+  shooter.clips[weaponKey]--;
   shooter.fireT = now;
 
   // tell everyone the shooter fired (muzzle flash on their billboard)
@@ -261,8 +328,10 @@ wss.on('connection', (ws) => {
           mapId: map.id,
           players: [...players.values()].map(stateOf),
           objective: OBJ ? objectiveView(Date.now()) : null,
+          pickups: pickupsView(),
         });
         broadcast({ t: S2C.SPAWN, id: p.id, x: p.x, y: p.y, ang: p.ang });
+        sendWeapon(p);   // seed the client's authoritative loadout
         break;
       }
       case C2S.MOVE: {
@@ -276,13 +345,27 @@ wss.on('connection', (ws) => {
         break;
       }
       case C2S.SHOOT:
-        if (!p.dead && Number.isFinite(m.ang)) resolveShot(p, m.ang, m.weapon || DEFAULT_WEAPON);
+        // the server hitscans with p's AUTHORITATIVE weapon (client can't spoof it)
+        if (!p.dead && Number.isFinite(m.ang)) resolveShot(p, m.ang);
         break;
       case C2S.RELOAD: {
-        const wp = WEAPONS[m.weapon || DEFAULT_WEAPON] || WEAPONS[DEFAULT_WEAPON];
-        if (!p.dead && Date.now() >= p.reloadUntil && p.clip < wp.clip) {
+        const key = p.weapon;
+        const wp = WEAPONS[key];
+        if (!p.dead && Date.now() >= p.reloadUntil && (p.clips[key] || 0) < wp.clip) {
           p.reloadUntil = Date.now() + wp.reloadMs;
-          setTimeout(() => { if (players.has(p.id) && !p.dead) p.clip = wp.clip; }, wp.reloadMs);
+          setTimeout(() => {
+            // only complete if still alive AND still holding the same weapon
+            if (players.has(p.id) && !p.dead && p.weapon === key) { p.clips[key] = wp.clip; sendWeapon(p); }
+          }, wp.reloadMs);
+        }
+        break;
+      }
+      case C2S.SWITCH: {
+        // switch to an OWNED weapon (ownership = a key in p.clips). Cancels a reload.
+        const key = m.weapon;
+        if (!p.dead && WEAPONS[key] && (key in p.clips) && key !== p.weapon) {
+          p.weapon = key; p.reloadUntil = 0;
+          sendWeapon(p);
         }
         break;
       }
@@ -306,6 +389,7 @@ setInterval(() => {
     if (p.dead && p.respawnAt && now >= p.respawnAt) respawn(p);
   }
   updateObjective(now);
+  updatePickups(now);
   broadcast({ t: S2C.STATE, players: [...players.values()].filter((p) => p.joined).map(stateOf) });
   if (OBJ) broadcast({ t: S2C.OBJECTIVE, ...objectiveView(now) });
 }, 1000 / TICK_HZ);

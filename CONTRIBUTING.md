@@ -53,8 +53,26 @@ usable you then:
 2. (Optional but nice) give it its own viewmodel in `drawGun()` — branch on `me.weapon`.
 3. Add a row to FEATURES.md.
 
-The client sends `weapon` on every `SHOOT`, and the server validates against
-`WEAPONS[weapon]`, so there's nothing to trust on the client side.
+The server now hitscans with each player's **authoritative** current weapon (set by
+pickups/switches — the client can't spoof which gun it's holding), so there's nothing
+to trust on the client side.
+
+### Pickups + switching (already built — your weapon plugs in for free)
+
+Weapon switching + map pickups are wired end to end (server-authoritative). To make a
+new weapon pickable, just drop a pickup entity into a deck in `shared/map.js`:
+
+```js
+{ id: 'weapon-railgun', type: 'pickup', kind: 'weapon', weapon: 'railgun', x: 16, y: 12 },
+```
+
+Walk over it and the server grants + switches to it (per-weapon ammo, lost on death,
+respawns after `WEAPON_PICKUP_RESPAWN_MS`). Number keys pick a `slot`, `Q`/scroll
+cycle. Give your weapon a `slot`, `color`, `fireSfx`/`reloadSfx` in `WEAPONS` and it
+shows up in the HUD, pickup billboard and switch order automatically. For an animated
+viewmodel, add a `WEAPON_ART.<key>` entry in `client/js/game.js` and drop
+`client/assets/art/<key>/{hero,fire,reload}/f*.png` (see `client/assets/ART.md` →
+the VIDEO→FRAMES pipeline).
 
 ## How to add a map (as NAMED DATA)
 

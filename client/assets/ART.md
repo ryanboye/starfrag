@@ -23,6 +23,11 @@ with the forge keyer (so the committed PNGs stay raw/regenerable):
 | `art/carbine.png`    | gpt-image-2 | 800×533 | POV pulse-carbine viewmodel | `drawGun()` (bob/kick/dip) |
 | `art/trooper.png`    | gpt-image-2 | 400×600 | enemy billboard — **front (S)** of the 8-way set | sprite blitter (`Net.players`) |
 | `art/trooper_{se,e,ne,n,nw,w,sw}.png` | gpt-image-2 **images/edits** (img2img from `trooper.png`) | 400×600 | 7 other yaw views of the SAME trooper | 8-way directional pick (`pickTrooper`) |
+| `art/scatter/hero.png` | gpt-image-2 | 512² | RIOT SCATTERGUN POV idle viewmodel | `drawGun()` (`WEAPON_ART.scatter`) |
+| `art/scatter/reload/f0..7.png` | **video→frames** (kling img2vid → gpt-image-2 repair) | 512² | scattergun pump-action RELOAD animation | `drawGun()` reload-frame cycle |
+| `art/scatter/fire/f0..4.png` | **video→frames** | 512² | scattergun FIRE animation (flash + shell eject) | `drawGun()` fire-frame cycle |
+| `art/plasma/hero.png` | gpt-image-2 | 512² | PLASMA REPEATER POV idle viewmodel | `drawGun()` (`WEAPON_ART.plasma`) |
+| `art/plasma/reload/f0..7.png` | **video→frames** | 512² | plasma energy-cell RELOAD animation (+ recharge arc) | `drawGun()` reload-frame cycle |
 
 `TEX.REACTOR` stays procedural (pulsing orange emissive) and `TEX.VIEWPORT` stays the
 raycast starfield/planet — both intentionally not textured. The muzzle flash is a
@@ -58,6 +63,34 @@ separate additive code overlay drawn at the carbine barrel tip on fire (never ba
   armor, red-visor helmet, '09' pauldron, skull knee decal, pulse carbine) and asks for
   one rotated view (front-3/4, side profile, rear-3/4, direct rear). Generated 1024×1536,
   flattened onto magenta, downscaled to 400×600. Tool: `generators/gen-edit.mjs`.
+
+## Weapon animations — the VIDEO→FRAMES pipeline
+
+The scattergun + plasma fire/reload viewmodels are **video-derived** (sprite-forge
+`forge/animate.md`): a gpt-image-2 POV **hero** frame is the start image for a
+**kling-v2-1 img2vid** (`scenario-custom.mjs`) driven by a motion prompt + the
+counter-prompt kit (locked camera, no VFX, first=last loop); `ffmpeg -vf fps=8`
+extracts frames; 5–8 are picked; each is **repaired** with gpt-image-2 `images/edits`
+(`[frame, hero]`, "match the reference, solid pure-magenta bg, crisp edges") to
+restore full chroma margin; the repaired frames are downscaled to 512² and committed.
+`drawGun()` cycles them: reload frames win over fire frames, and the video motion
+carries the animation (procedural dip suppressed). Muzzle flash stays a separate
+tinted overlay. The FULL flow (hero → video → extracted → picked → repaired → in-game)
+is receipted in [`../../docs/pipeline/`](../../docs/pipeline/README.md); raw frames +
+source .mp4s live on the box in `scratch-art/forge/`.
+
+**Viewmodel sizing rule (drawGun):** every viewmodel is sized so its visible barrel
+tip lands on `GUN_TOP_Y ≈ 0.54·SCREEN_H`, keeping the gun in the BOTTOM ~46% of the
+fixed 384×240 framebuffer — crosshair + upper view always clear, even on wide-short
+mobile-landscape aspects (with `object-fit:contain`).
+
+- **scatter/hero** — "…chunky heavy sci-fi pump-action scattergun… fat cylindrical
+  magazine tube under a ribbed pump forestock, wide twin-barrel muzzle foreshortened
+  to the crosshair, hazard-orange accents, glowing amber ammo readout… bottom two-
+  thirds, solid pure magenta #FF00FF." (1:1)
+- **plasma/hero** — "…sleek high-tech sci-fi plasma repeater rifle… glowing acid-green
+  plasma coils and vents, translucent green energy chamber, foreshortened to the
+  crosshair, neon-green emissive accents… solid pure magenta #FF00FF." (1:1)
 
 ## Regenerating
 

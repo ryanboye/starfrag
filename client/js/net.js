@@ -66,6 +66,7 @@ export const Net = {
     if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(msg));
   },
   move(x, y, ang, moving) { this.send({ t: C2S.MOVE, x, y, ang, moving }); },
-  shoot(ang, weapon) { this.send({ t: C2S.SHOOT, ang, weapon }); },
+  shoot(ang, weapon) { this.send({ t: C2S.SHOOT, ang, weapon }); },   // weapon is advisory; server uses its authoritative one
   reload(weapon) { this.send({ t: C2S.RELOAD, weapon }); },
+  switchWeapon(weapon) { this.send({ t: C2S.SWITCH, weapon }); },
 };
