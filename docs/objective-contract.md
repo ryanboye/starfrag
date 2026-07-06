@@ -90,6 +90,32 @@ Add to a deck's `entities` in `shared/map.js` (see `HANGAR_BAY`):
 `compileMap` returns `consoles: [...]` and `airlock: {...}`; the server activates
 the objective iff `airlock` is present. Deathmatch decks just omit them.
 
+## Re-theming the SAME machine (deck7v2 "OVERLOAD THE CORE")
+
+The state machine is generic — a deck can re-theme and re-time it without touching the
+logic, via an optional `objective` block on the arena data (see `DECK7V2`):
+
+```js
+objective: {
+  mode: 'overload',
+  labels: { arm, armSub, pad, defend, defendSub, win, winSub, voidWin, feed },
+  timing: { DOOR_OPEN_MS: 6000, VENT_MS: 3000 },   // overrides the shared OBJECTIVE knobs
+}
+```
+
+- **Server**: `OBJT = { ...OBJECTIVE, ...(arena.objective.timing || {}) }` — the machine
+  reads durations from `OBJT` (so deck7v2's "opening" is a 6-second overload countdown),
+  and `objectiveView.mode` comes from `arena.objective.mode`. Everything else (phases,
+  console capture, majority-holder win, N-1 vent kills) is byte-for-byte the airlock loop.
+- **Client**: reads `world.objective.labels`/`.timing` **locally** (it compiles the same
+  arena), so no label bytes ride the wire. The HUD shows "OVERLOAD THE CORE" / the arm
+  prompt / the killfeed verb "OVERLOADED"; the door/vent FX fractions use the same timing.
+- Decks that omit `objective` (hangar-bay) fall back to the airlock defaults unchanged.
+
+deck7v2's `airlock` entity is the **core-implosion region** (no viewport → no bay-door
+crank; the telegraphed HUD countdown + implosion camera-pull carry it). Test:
+`tools/objv2-test.mjs` drives 3 holders A/B/C through arm → overload → win.
+
 ## Verify
 
 `node tools/obj-test.mjs` against a `STARFRAG_MAP=hangar-bay` server drives 4

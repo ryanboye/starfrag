@@ -50,10 +50,20 @@
   #objective.warn .phase { color:var(--hot); }
   #objective.vent .phase { color:var(--win); text-shadow:0 0 10px var(--win); }
   #objective.vent .sub { color:var(--hot); }
+  #objective .prompt { margin-top:5px; font-size:10px; letter-spacing:2px; color:var(--amber);
+    opacity:0.8; animation:promptpulse 1.6s ease-in-out infinite; }
+  @keyframes promptpulse { 0%,100%{opacity:0.45} 50%{opacity:0.95} }
   #objective .pips { margin-top:5px; display:flex; gap:6px; justify-content:center; }
   #objective .pip { width:12px; height:14px; border:1px solid #3a4a52; position:relative;
     display:inline-block; background:rgba(0,0,0,0.4); }
   #objective .pip i { position:absolute; left:0; bottom:0; width:100%; display:block; }
+
+  /* THE QUAD telegraph clock (deck7v2 only) — left rail, clear of the centre objective stack */
+  #quadclock { display:none; top:44px; left:12px; text-align:left;
+    font-size:12px; font-weight:bold; letter-spacing:2px; color:#c86bff; }
+  #quadclock.ready { color:#e6b3ff; text-shadow:0 0 10px #c86bff;
+    animation:quadpulse 0.7s ease-in-out infinite; }
+  @keyframes quadpulse { 0%,100%{opacity:0.7} 50%{opacity:1} }
 
   /* start / dead overlays */
   #overlay { position:absolute; inset:0; z-index:20; display:flex; flex-direction:column;
@@ -63,6 +73,16 @@
   #overlay .sub { font-size:13px; color:var(--cyan); opacity:0.85; max-width:440px; line-height:1.6; }
   #overlay .go { font-size:14px; border:1px solid var(--amber); padding:10px 22px; margin-top:8px; }
   #overlay .keys { font-size:11px; opacity:0.6; }
+  /* start-screen arena picker */
+  #arenapick { display:flex; gap:14px; flex-wrap:wrap; justify-content:center; margin:6px 0; }
+  .acard { width:200px; max-width:42vw; padding:14px 16px; text-align:center; cursor:pointer;
+    border:1px solid rgba(120,140,160,0.5); border-radius:6px; background:rgba(12,16,24,0.6);
+    transition:transform .12s ease, box-shadow .12s ease, border-color .12s ease; }
+  .acard:hover { transform:translateY(-2px); }
+  .acard.cur { border-color:var(--ac); box-shadow:0 0 16px -2px var(--ac); background:rgba(20,26,36,0.75); }
+  .acard .an { font-size:18px; letter-spacing:3px; color:var(--ac); font-weight:bold; }
+  .acard .at { font-size:10px; letter-spacing:1px; color:#9fb4c4; margin-top:6px; min-height:24px; }
+  .acard .ago { font-size:11px; letter-spacing:2px; margin-top:10px; color:var(--ac); opacity:0.9; }
   .hide { display:none !important; }
 </style>
 
@@ -73,6 +93,7 @@
   <div id="ventflash"></div>
 
   <div class="hud" id="objective"></div>
+  <div class="hud" id="quadclock"></div>
   <div class="hud" id="arena">STARFRAG · connecting…</div>
   <div class="hud" id="status"></div>
   <div class="hud" id="scoreboard"></div>
@@ -101,4 +122,4 @@
 <script src="playtest-link.js?v=rec1"></script>
 <!-- ?v bumped on client changes: Cloudflare caches js/* for 5d, the HTML is served
      fresh (cf-cache DYNAMIC), so a new query key is how a client edit reaches users. -->
-<script type="module" src="js/game.js?v=weapons2"></script>
+<script type="module" src="js/game.js?v=deck7v2"></script>
