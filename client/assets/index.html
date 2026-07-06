@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STARFRAG · Asset Library</title>
+<style>
+  :root { --bg:#080c12; --panel:#0e1622; --edge:#26456a; --ink:#cfe0f0; --dim:#6b8299; --hi:#7fd8ff; --amber:#ffb84d; }
+  * { box-sizing: border-box; }
+  html,body { margin:0; background:var(--bg); color:var(--ink);
+    font-family:'Segoe UI',system-ui,-apple-system,sans-serif; }
+  header { padding:26px 22px 14px; border-bottom:1px solid var(--edge);
+    background:linear-gradient(180deg,#0c141f,#080c12); position:sticky; top:0; z-index:5; }
+  h1 { margin:0; font-size:26px; letter-spacing:2px; color:var(--hi); font-weight:800; }
+  .sub { color:var(--dim); font-size:13.5px; margin-top:4px; }
+  .wrap { max-width:1200px; margin:0 auto; padding:22px; }
+  h2 { font-size:15px; letter-spacing:2px; color:var(--amber); text-transform:uppercase;
+    border-left:3px solid var(--amber); padding-left:10px; margin:34px 0 4px; }
+  .note { color:var(--dim); font-size:12px; margin:0 0 14px 13px; }
+  .grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); }
+  .card { background:var(--panel); border:1px solid var(--edge); border-radius:10px; padding:12px;
+    display:flex; flex-direction:column; align-items:center; }
+  .card .cap { font-size:12px; color:var(--dim); margin-top:8px; text-align:center; }
+  .card .cap b { color:var(--ink); display:block; font-size:12.5px; }
+  .cell { width:100%; aspect-ratio:1/1; display:flex; align-items:center; justify-content:center;
+    background:
+      linear-gradient(45deg,#131c28 25%,transparent 25%,transparent 75%,#131c28 75%) 0 0/18px 18px,
+      linear-gradient(45deg,#131c28 25%,#0b111a 25%,#0b111a 75%,#131c28 75%) 9px 9px/18px 18px, #0b111a;
+    border-radius:6px; overflow:hidden; }
+  canvas, img.raw { image-rendering:pixelated; max-width:100%; max-height:100%; }
+  /* weapon anim rows */
+  .weapon { background:var(--panel); border:1px solid var(--edge); border-radius:12px;
+    padding:16px 16px 8px; margin-bottom:16px; }
+  .weapon h3 { margin:0 0 2px; font-size:18px; color:var(--hi); }
+  .weapon .id { color:var(--dim); font-size:12px; margin-bottom:12px; }
+  .strip { display:flex; align-items:flex-end; gap:6px; overflow-x:auto; padding-bottom:10px; }
+  .strip .lbl { min-width:66px; font-size:11px; color:var(--amber); letter-spacing:1px;
+    text-transform:uppercase; align-self:center; }
+  .fr { width:96px; height:96px; flex:0 0 auto; }
+  .fr .cell { width:96px; height:96px; }
+  .fr .n { font-size:10px; color:var(--dim); text-align:center; margin-top:2px; }
+  .compass { display:grid; grid-template-columns:repeat(3,120px); grid-template-rows:repeat(3,120px);
+    gap:8px; justify-content:center; margin-top:6px; }
+  .compass .card { padding:8px; }
+  .compass .cell { }
+  footer { color:var(--dim); font-size:12px; text-align:center; padding:26px; border-top:1px solid var(--edge); margin-top:20px; }
+  a { color:var(--hi); }
+</style>
+</head>
+<body>
+<header>
+  <h1>STARFRAG · ASSET LIBRARY</h1>
+  <div class="sub">every sprite in the game — weapons, enemies, environment. magenta chroma keyed out in-browser (same keyer the game uses at load) so these render as they appear in-game.</div>
+</header>
+<div class="wrap">
+
+  <h2>Weapons</h2>
+  <p class="note">hero viewmodel + firing / reload / charge animation strips. drag a strip sideways to scrub the frames.</p>
+  <div id="weapons"></div>
+
+  <h2>Enemy — 8-way Trooper</h2>
+  <p class="note">directional sprites, arranged by facing (relative to the viewer).</p>
+  <div class="compass" id="troopers"></div>
+
+  <h2>Environment</h2>
+  <p class="note">wall + floor textures used by the raycaster.</p>
+  <div class="grid" id="textures"></div>
+
+</div>
+<footer>STARFRAG — <a href="../">back to the game</a> · assets generated via the sprite-forge pipeline</footer>
+
+<script>
+// ---- chroma keyer (matches the game: m = min(r,b) - g; >52 → transparent; despill 18..52) ----
+function keyed(src, done) {
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = () => {
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth; c.height = img.naturalHeight;
+    const x = c.getContext('2d');
+    x.drawImage(img, 0, 0);
+    try {
+      const d = x.getImageData(0, 0, c.width, c.height), p = d.data;
+      for (let i = 0; i < p.length; i += 4) {
+        const r = p[i], g = p[i+1], b = p[i+2];
+        const m = Math.min(r, b) - g;
+        if (m > 52) { p[i+3] = 0; }
+        else if (m > 18) { const t = (m - 18) / 34; p[i] = r * (1-t) + g * t; p[i+2] = b * (1-t) + g * t; }
+      }
+      x.putImageData(d, 0, 0);
+    } catch (e) { /* if tainted, just show raw */ }
+    done(c);
+  };
+  img.onerror = () => done(null);
+  img.src = src;
+}
+function cellWith(node) { const cell = document.createElement('div'); cell.className = 'cell'; if (node) cell.appendChild(node); return cell; }
+function frameEl(src, label) {
+  const wrap = document.createElement('div'); wrap.className = 'fr';
+  const holder = document.createElement('div'); wrap.appendChild(holder);
+  keyed(src, (cv) => { holder.replaceWith(cellWith(cv)); const n = document.createElement('div'); n.className='n'; n.textContent = label; wrap.appendChild(n); });
+  return wrap;
+}
+
+const WEAPONS = [
+  { name:'Pulse Carbine', id:'carbine · starter', hero:'art/carbine.png', anims:{} },
+  { name:'Riot Scattergun', id:'scatter · pickup', hero:'art/scatter/hero.png', anims:{ fire:5, reload:8 } },
+  { name:'Plasma Repeater', id:'plasma · pickup', hero:'art/plasma/hero.png', anims:{ reload:8 } },
+  { name:'Railgun', id:'railgun · charge-up power weapon', hero:'art/railgun/hero.png', anims:{ charge:8, fire:5, reload:8 } },
+];
+const wq = document.getElementById('weapons');
+for (const w of WEAPONS) {
+  const box = document.createElement('div'); box.className = 'weapon';
+  box.innerHTML = `<h3>${w.name}</h3><div class="id">${w.id}</div>`;
+  // hero row
+  const heroStrip = document.createElement('div'); heroStrip.className = 'strip';
+  const hl = document.createElement('div'); hl.className='lbl'; hl.textContent='idle'; heroStrip.appendChild(hl);
+  heroStrip.appendChild(frameEl(w.hero, 'hero'));
+  box.appendChild(heroStrip);
+  // anim strips
+  const key = w.hero.split('/')[1] && w.hero.includes('/') ? w.hero.split('/')[0].replace('art','art') : null;
+  const base = w.hero.includes('/hero.png') ? w.hero.replace('/hero.png','') : null;
+  for (const [anim, count] of Object.entries(w.anims)) {
+    const s = document.createElement('div'); s.className = 'strip';
+    const l = document.createElement('div'); l.className='lbl'; l.textContent = anim; s.appendChild(l);
+    for (let i = 0; i < count; i++) s.appendChild(frameEl(`${base}/${anim}/f${i}.png`, 'f'+i));
+    box.appendChild(s);
+  }
+  wq.appendChild(box);
+}
+
+// troopers — compass layout (n at top). center cell blank.
+const DIRS = { n:'trooper_n', ne:'trooper_ne', e:'trooper_e', se:'trooper_se', s:'trooper', sw:'trooper_sw', w:'trooper_w', nw:'trooper_nw' };
+const SLOTS = ['nw','n','ne','w',null,'e','sw','s','se'];
+const tq = document.getElementById('troopers');
+for (const slot of SLOTS) {
+  const card = document.createElement('div'); card.className = 'card';
+  if (!slot) { card.style.visibility='hidden'; tq.appendChild(card); continue; }
+  const holder = document.createElement('div'); card.appendChild(holder);
+  keyed(`art/${DIRS[slot]}.png`, (cv) => { holder.replaceWith(cellWith(cv)); const cap = document.createElement('div'); cap.className='cap'; cap.innerHTML = `<b>${slot.toUpperCase()}</b>`; card.appendChild(cap); });
+  tq.appendChild(card);
+}
+
+// textures — shown raw (opaque tiles, no key)
+const TEX = ['wall_hull','wall_tech','wall_panel','floor_deck'];
+const xq = document.getElementById('textures');
+for (const t of TEX) {
+  const card = document.createElement('div'); card.className = 'card';
+  const cell = document.createElement('div'); cell.className = 'cell';
+  const im = document.createElement('img'); im.className = 'raw'; im.src = `art/${t}.png`; im.alt = t;
+  cell.appendChild(im); card.appendChild(cell);
+  const cap = document.createElement('div'); cap.className='cap'; cap.innerHTML = `<b>${t.replace('_',' ')}</b>`;
+  card.appendChild(cap);
+  xq.appendChild(card);
+}
+</script>
+</body>
+</html>
