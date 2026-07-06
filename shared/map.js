@@ -237,6 +237,216 @@ export const HANGAR_BAY = {
   ],
 };
 
+// ============================================================================
+// DECK 7-V2 — "REACTOR OVERLOAD" (crew-reviewed, owner-approved redesign).
+//
+// Where deck7 is a RING OF EIGHT near-equal rooms for pure deathmatch, v2 is a
+// FIVE-ZONE PLUS: one big contested REACTOR CORE at the centre and four cardinal
+// arms — each a DISTINCT place with its own geometry and role — wired by an outer
+// rotation ring (the four corner corridors) plus four risky spokes (the core doors)
+// straight into the middle. Design language: "spread, then concentrate."
+//
+//   ZONES (5):
+//     REACTOR CORE (centre)  crossroads-with-cover: a 2×2 reactor block dead-centre
+//                            breaks every straight cross-core shot; the RAILGUN sits
+//                            on the exposed core floor, sightlined from all 4 doors
+//                            (grab-and-go, never campable). The OVERLOAD climaxes here.
+//     COMMAND BRIDGE  (N)    long E-W sightline hall under a north window. PLASMA + CONSOLE A.
+//     CARGO HOLD      (E)    tight crate CQC maze. SCATTERGUN + mega-health + CONSOLE B.
+//     DOCKING BAY     (S)    open, the big south viewport to space, flank angles. armor + ammo + CONSOLE C.
+//     ENGINEERING     (W)    hazard catwalk lanes. THE QUAD (far NW corner, high-risk) + health + ammo.
+//
+//   OBJECTIVE — "OVERLOAD THE CORE" (reuses the airlock/console STATE MACHINE, see
+//   server.mjs): arm the 3 consoles A/B/C — deliberately spread across bridge/cargo/
+//   docking so you must TRAVERSE the map — arming all three UNLOCKS the overload; a
+//   telegraphed detonation countdown runs at the exposed core; the majority console-
+//   holder rides it out and WINS while the core implodes and vents everyone else.
+//   Same machine as hangar-bay's airlock; only the theme (`objective` block below)
+//   and the region (the core, not a bay door) differ.
+//
+// TOPOLOGY NOTE for maintainers: v2 REUSES deck7's proven partition skeleton — the
+// four lines x=10, x=21, y=10, y=21 with door gaps at ±(4-5) / (15-16) / (25-26).
+// That guarantees the door graph (4 core spokes at the 15-16 gaps + 8 ring doors)
+// is the same validated topology. What differs is the CONTENT: only the 4 cardinal
+// blocks are full zones; the 4 corner blocks are ring CORRIDORS (a block in each,
+// walked around), and the objective + railgun-core focus is new.
+//
+// >>> CELL COORDINATES for Seb's re-baseline are exported as DECK7V2_CELLS below. <<<
+export const DECK7V2 = {
+  id: 'deck7v2',
+  name: 'DECK 7-V2 — REACTOR OVERLOAD',
+  width: 32,
+  height: 32,
+  // The planet hangs in the big SOUTH docking-bay window: planetAzimuth ≈ +1.55 rad
+  // (facing south, +y). Amber world — distinct from deck7's blue north planet.
+  sky: { planetAzimuth: 1.55, planetTint: '#c08a4a', planetSize: 0.5 },
+  // Presentation + timing for the reused objective machine. `timing` OVERRIDES the
+  // shared OBJECTIVE tunables for THIS deck only (server spreads it over the defaults;
+  // hangar-bay, which omits this, keeps the defaults). A long DOOR_OPEN_MS = the
+  // telegraphed OVERLOAD COUNTDOWN you defend. `labels` theme the client HUD (the
+  // client compiles this arena locally, so no label bytes ride the wire).
+  objective: {
+    mode: 'overload',
+    labels: {
+      arm: 'ARM THE CONSOLES', armSub: 'CONSOLES',      // idle / arming
+      pad: 'STAND ON A PAD TO ARM',
+      defend: 'OVERLOAD THE CORE', defendSub: 'DETONATION', // opening (the countdown you defend)
+      win: 'WINS', winSub: 'CORE BREACH',               // venting
+      voidWin: 'THE CORE WINS',
+      feed: 'OVERLOADED',                               // killfeed verb (vs 'VENTED')
+    },
+    timing: { DOOR_OPEN_MS: 6000, VENT_MS: 3000 },      // 6s telegraphed overload, 3s implosion
+  },
+  entities: [
+    // --- shell ----------------------------------------------------------------
+    { id: 'hull-shell', type: 'wall-rect', x: 0, y: 0, w: 32, h: 32, tex: 'HULL', border: true },
+
+    // === PARTITION SKELETON (same as deck7: x=10,21 & y=10,21, gaps at 4-5/15-16/25-26)
+    // x=10 — doors: y4-5 (NW↔bridge), y15-16 (core-W spoke), y25-26 (SW↔docking)
+    { id: 'wall-x10-a', type: 'wall-rect', x: 10, y: 1,  w: 1, h: 3, tex: 'PANEL' },
+    { id: 'wall-x10-b', type: 'wall-rect', x: 10, y: 6,  w: 1, h: 9, tex: 'PANEL' },
+    { id: 'wall-x10-c', type: 'wall-rect', x: 10, y: 17, w: 1, h: 8, tex: 'PANEL' },
+    { id: 'wall-x10-d', type: 'wall-rect', x: 10, y: 27, w: 1, h: 4, tex: 'PANEL' },
+    // x=21 — doors: y4-5 (NE↔bridge), y15-16 (core-E spoke), y25-26 (SE↔docking)
+    { id: 'wall-x21-a', type: 'wall-rect', x: 21, y: 1,  w: 1, h: 3, tex: 'PANEL' },
+    { id: 'wall-x21-b', type: 'wall-rect', x: 21, y: 6,  w: 1, h: 9, tex: 'PANEL' },
+    { id: 'wall-x21-c', type: 'wall-rect', x: 21, y: 17, w: 1, h: 8, tex: 'PANEL' },
+    { id: 'wall-x21-d', type: 'wall-rect', x: 21, y: 27, w: 1, h: 4, tex: 'PANEL' },
+    // y=10 — doors: x4-5 (NW↔engineering), x15-16 (core-N spoke), x25-26 (NE↔cargo)
+    { id: 'wall-y10-a', type: 'wall-rect', x: 1,  y: 10, w: 3, h: 1, tex: 'PANEL' },
+    { id: 'wall-y10-b', type: 'wall-rect', x: 6,  y: 10, w: 9, h: 1, tex: 'PANEL' },
+    { id: 'wall-y10-c', type: 'wall-rect', x: 17, y: 10, w: 8, h: 1, tex: 'PANEL' },
+    { id: 'wall-y10-d', type: 'wall-rect', x: 27, y: 10, w: 4, h: 1, tex: 'PANEL' },
+    // y=21 — doors: x4-5 (SW↔engineering), x15-16 (core-S spoke), x25-26 (SE↔cargo)
+    { id: 'wall-y21-a', type: 'wall-rect', x: 1,  y: 21, w: 3, h: 1, tex: 'PANEL' },
+    { id: 'wall-y21-b', type: 'wall-rect', x: 6,  y: 21, w: 9, h: 1, tex: 'PANEL' },
+    { id: 'wall-y21-c', type: 'wall-rect', x: 17, y: 21, w: 8, h: 1, tex: 'PANEL' },
+    { id: 'wall-y21-d', type: 'wall-rect', x: 27, y: 21, w: 4, h: 1, tex: 'PANEL' },
+
+    // === VIEWPORTS — every spawn must see space (validate rule). Planet frames in
+    // the big SOUTH docking window; the rest are starfield slits.
+    { id: 'viewport-dock-s',  type: 'viewport', x: 12, y: 31, w: 8, h: 1 },  // big docking bay-window
+    { id: 'viewport-bridge-n', type: 'viewport', x: 12, y: 0, w: 8, h: 1 },  // bridge north slit
+    { id: 'viewport-cargo-e', type: 'viewport', x: 31, y: 13, w: 1, h: 6 },  // cargo east slit
+    { id: 'viewport-eng-w',   type: 'viewport', x: 0,  y: 13, w: 1, h: 6 },  // engineering west slit
+    { id: 'viewport-nw-w',    type: 'viewport', x: 0,  y: 3,  w: 1, h: 3 },  // NW corridor
+    { id: 'viewport-ne-e',    type: 'viewport', x: 31, y: 3,  w: 1, h: 3 },  // NE corridor
+    { id: 'viewport-sw-s',    type: 'viewport', x: 3,  y: 31, w: 3, h: 1 },  // SW corridor
+    { id: 'viewport-se-s',    type: 'viewport', x: 26, y: 31, w: 3, h: 1 },  // SE corridor
+
+    // === REACTOR CORE (centre, x11-20 y11-20): crossroads-with-cover ==========
+    // Lone 2×2 reactor block dead-centre — the ONLY orange glow, the map's landmark —
+    // blocks every straight N-S / E-W cross-core shot. The core is otherwise open:
+    // a true crossroads. The RAILGUN sits off-axis on the exposed floor (see pickups),
+    // visible from all 4 doors but behind none of them.
+    { id: 'reactor-core', type: 'wall-rect', x: 15, y: 15, w: 2, h: 2, tex: 'REACTOR' },
+
+    // === COMMAND BRIDGE (N arm, x11-20 y1-9): long E-W sightline hall =========
+    // The two ring doors (x=10 @ y4-5, x=21 @ y4-5) align into a long E-W lane across
+    // the bridge; two pylons sit ON that lane so it's a peek-and-trade, not a rail.
+    // Command consoles cluster mid-room for cover around CONSOLE A.
+    { id: 'bridge-pylon-w', type: 'wall-rect', x: 13, y: 5, w: 1, h: 1, tex: 'TECH' },
+    { id: 'bridge-pylon-e', type: 'wall-rect', x: 18, y: 5, w: 1, h: 1, tex: 'TECH' },
+    { id: 'bridge-console', type: 'wall-rect', x: 15, y: 7, w: 2, h: 1, tex: 'TECH' },
+    { id: 'bridge-desk-w',  type: 'wall-rect', x: 12, y: 2, w: 1, h: 2, tex: 'TECH' },
+
+    // === CARGO HOLD (E arm, x22-30 y11-20): tight crate CQC maze =============
+    // Staggered container stacks make hard corners everywhere — the map's close-
+    // quarters room. CONSOLE B, the scattergun + mega-health hide among the crates.
+    { id: 'cargo-crate-1', type: 'wall-rect', x: 23, y: 11, w: 2, h: 2, tex: 'PILLAR' },
+    { id: 'cargo-crate-2', type: 'wall-rect', x: 27, y: 12, w: 2, h: 2, tex: 'PILLAR' },
+    { id: 'cargo-crate-3', type: 'wall-rect', x: 24, y: 15, w: 1, h: 2, tex: 'PILLAR' },
+    { id: 'cargo-crate-4', type: 'wall-rect', x: 27, y: 16, w: 2, h: 1, tex: 'PILLAR' },
+    { id: 'cargo-crate-5', type: 'wall-rect', x: 23, y: 18, w: 2, h: 2, tex: 'PILLAR' },
+
+    // === DOCKING BAY (S arm, x11-20 y22-30): open, flank angles, space window =
+    // The most open zone, under the big south planet-window. A couple of angled
+    // barriers give flank cover without closing it in. CONSOLE C + armor + ammo.
+    { id: 'dock-barrier-w', type: 'wall-rect', x: 13, y: 24, w: 1, h: 2, tex: 'PANEL' },
+    { id: 'dock-barrier-e', type: 'wall-rect', x: 18, y: 27, w: 1, h: 2, tex: 'PANEL' },
+    { id: 'dock-crate',     type: 'wall-rect', x: 15, y: 29, w: 2, h: 1, tex: 'PILLAR' },
+
+    // === ENGINEERING (W arm, x1-9 y11-20): hazard catwalk lanes ==============
+    // Broken up by conduit blocks into narrow catwalk lanes (the "vertical" read of a
+    // 2.5D deck). THE QUAD sits far NW — a high-risk dead-corner draw; health + ammo.
+    { id: 'eng-conduit-1', type: 'wall-rect', x: 4, y: 12, w: 2, h: 1, tex: 'TECH' },
+    { id: 'eng-conduit-2', type: 'wall-rect', x: 6, y: 14, w: 1, h: 3, tex: 'TECH' },
+    { id: 'eng-conduit-3', type: 'wall-rect', x: 3, y: 16, w: 2, h: 1, tex: 'TECH' },
+    { id: 'eng-conduit-4', type: 'wall-rect', x: 4, y: 18, w: 2, h: 2, tex: 'PILLAR' },
+
+    // === CORNER RING CORRIDORS: a block in each corner you walk AROUND, linking the
+    // two adjacent arm doors into the outer rotation ring (sustain lives OFF the ring).
+    { id: 'ring-nw', type: 'wall-rect', x: 3,  y: 3,  w: 4, h: 4, tex: 'HULL' },
+    { id: 'ring-ne', type: 'wall-rect', x: 25, y: 3,  w: 4, h: 4, tex: 'HULL' },
+    { id: 'ring-se', type: 'wall-rect', x: 25, y: 25, w: 4, h: 4, tex: 'HULL' },
+    { id: 'ring-sw', type: 'wall-rect', x: 3,  y: 25, w: 4, h: 4, tex: 'HULL' },
+
+    // === SPAWNS — one per zone + one per ring corridor (8). Tucked at a zone edge,
+    // facing inward; walled from one another so no spawn sees another (verified).
+    { id: 'spawn-bridge', type: 'spawn', x: 15.5, y: 2.5,  ang: 1.4 },   // bridge, facing S into core
+    { id: 'spawn-cargo',  type: 'spawn', x: 29.5, y: 15.5, ang: 3.14 },  // cargo, facing W
+    { id: 'spawn-dock',   type: 'spawn', x: 12.5, y: 29.5, ang: -1.6 },  // docking, facing N into core
+    { id: 'spawn-eng',    type: 'spawn', x: 1.5,  y: 15.5, ang: 0 },     // engineering, facing E
+    { id: 'spawn-nw',     type: 'spawn', x: 1.5,  y: 8.5,  ang: -0.5 },  // NW corridor
+    { id: 'spawn-ne',     type: 'spawn', x: 30.5, y: 8.5,  ang: 3.6 },   // NE corridor
+    { id: 'spawn-se',     type: 'spawn', x: 30.5, y: 23.5, ang: 3.6 },   // SE corridor
+    { id: 'spawn-sw',     type: 'spawn', x: 1.5,  y: 23.5, ang: 0.5 },   // SW corridor
+
+    // === CONSOLES (objective) — A/B/C spread across three different zones so arming
+    // all three FORCES a full map traversal. Floor devices (stand on the pad to arm).
+    { id: 'console-a', type: 'console', x: 15.5, y: 4.5 },   // COMMAND BRIDGE (N)
+    { id: 'console-b', type: 'console', x: 26.5, y: 15.5 },  // CARGO HOLD (E)
+    { id: 'console-c', type: 'console', x: 15.5, y: 26.5 },  // DOCKING BAY (S)
+
+    // === OVERLOAD REGION — the core interior. Reuses the `airlock` (vent) entity so
+    // the objective machine activates; here the "vent" is the core implosion, and the
+    // pull sucks everyone toward the core centre. No door-crank (there's no viewport
+    // at the core) — the telegraphed HUD countdown + implosion carry it.
+    { id: 'core-overload', type: 'airlock', x: 12, y: 12, w: 8, h: 8, dir: 'north' },
+
+    // === PICKUPS ================================================================
+    // WEAPONS (server-authoritative grab+respawn): contested-centre + distributed.
+    { id: 'weapon-railgun', type: 'pickup', kind: 'weapon', weapon: 'railgun', x: 13.5, y: 18.5 }, // EXPOSED core floor, off-axis
+    { id: 'weapon-plasma',  type: 'pickup', kind: 'weapon', weapon: 'plasma',  x: 18.5, y: 2.5 },  // command bridge (N)
+    { id: 'weapon-scatter', type: 'pickup', kind: 'weapon', weapon: 'scatter', x: 28.5, y: 18.5 }, // deep in the cargo maze (E)
+    // SUSTAIN — at the edges, off the ring (billboards; health/armor/ammo/quad wiring
+    // is the same pre-existing "separate feature" as on deck7 — placed to the design).
+    { id: 'pickup-cargo-mega',  type: 'pickup', kind: 'health', x: 25.5, y: 13.5 }, // cargo mega-health
+    { id: 'pickup-dock-armor',  type: 'pickup', kind: 'armor',  x: 17.5, y: 28.5 }, // docking armor
+    { id: 'pickup-dock-ammo',   type: 'pickup', kind: 'ammo',   x: 12.5, y: 28.5 }, // docking ammo
+    { id: 'pickup-eng-health',  type: 'pickup', kind: 'health', x: 2.5,  y: 19.5 }, // engineering health
+    { id: 'pickup-eng-ammo',    type: 'pickup', kind: 'ammo',   x: 8.5,  y: 12.5 }, // engineering ammo (near core door, risky)
+    // THE QUAD — far NW dead-corner of engineering, high-risk. A TELEGRAPHED TIMED
+    // item: the client glows-up the pad on a cycle + shows a HUD clock ("QUAD 0:12")
+    // — the anti-snowball / casual on-ramp. (Damage-multiplier EFFECT is deferred:
+    // a server powerup system is out of this deck's tightly-scoped brief.)
+    { id: 'power-quad', type: 'pickup', kind: 'quad', x: 2.5, y: 12.5 },
+  ],
+};
+
+// >>> SEB: authoritative CELL COORDINATES for re-baselining obj-test / mobile-verify /
+// validate-map against deck7v2. Consoles are stand-on pads (arm within OBJECTIVE.
+// ARM_RADIUS); the overload region is the core-implosion rect. Kept beside the data so
+// it can't drift from it. <<<
+export const DECK7V2_CELLS = {
+  consoles: [
+    { id: 'console-a', x: 15.5, y: 4.5,  zone: 'command-bridge' },
+    { id: 'console-b', x: 26.5, y: 15.5, zone: 'cargo-hold' },
+    { id: 'console-c', x: 15.5, y: 26.5, zone: 'docking-bay' },
+  ],
+  overload: { id: 'core-overload', x: 12, y: 12, w: 8, h: 8 },   // core interior rect
+  coreDoors: [
+    { side: 'N', x: 15.5, y: 10.5 }, { side: 'S', x: 15.5, y: 20.5 },
+    { side: 'W', x: 10.5, y: 15.5 }, { side: 'E', x: 20.5, y: 15.5 },
+  ],
+  weapons: [
+    { id: 'weapon-railgun', x: 13.5, y: 18.5, zone: 'reactor-core' },
+    { id: 'weapon-plasma',  x: 18.5, y: 2.5,  zone: 'command-bridge' },
+    { id: 'weapon-scatter', x: 28.5, y: 18.5, zone: 'cargo-hold' },
+  ],
+  quad: { id: 'power-quad', x: 2.5, y: 12.5, zone: 'engineering' },
+};
+
 // Registry of all decks, keyed by id. `pickArena` resolves a map id (from the
 // server's STARFRAG_MAP env or the client's ?map= param) back to its arena,
 // falling back to the default derelict deck. Full rotation/voting between rounds
@@ -244,6 +454,7 @@ export const HANGAR_BAY = {
 export const MAPS = {
   [ARENA.id]: ARENA,
   [HANGAR_BAY.id]: HANGAR_BAY,
+  [DECK7V2.id]: DECK7V2,
 };
 export function pickArena(id) {
   return (id && MAPS[id]) || ARENA;
@@ -301,7 +512,7 @@ export function compileMap(arena = ARENA) {
         break;
     }
   }
-  return { W, H, grid, spawns, pickups, viewports, consoles, airlock, id: arena.id, name: arena.name, sky: arena.sky };
+  return { W, H, grid, spawns, pickups, viewports, consoles, airlock, id: arena.id, name: arena.name, sky: arena.sky, objective: arena.objective || null };
 }
 
 // Is a world cell solid? VIEWPORT counts as solid wall for collision + occlusion.

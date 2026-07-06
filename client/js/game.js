@@ -78,6 +78,23 @@ const weaponSpots = world.pickups.filter((p) => p.kind === 'weapon');
 const pickupTaken = new Map();                 // pickup id -> true while grabbed (pad dark)
 let pickupToast = { text: '', until: 0 };      // brief "PICKED UP <NAME>" banner
 
+// THE QUAD (deck7v2) — a TELEGRAPHED TIMED powerup: a far-corner pad that glows up on
+// a fixed cycle with a HUD clock ("QUAD 0:12"), so everyone knows WHEN it's contested
+// — the anti-snowball / casual on-ramp. The cycle is keyed to the WALL CLOCK so every
+// client agrees within a second (no server message). HONEST SCOPE: this is the
+// telegraph + marker only; the damage-multiplier EFFECT is deferred (it needs a
+// server powerup system, out of this deck's tightly-scoped brief).
+const powerSpots = world.pickups.filter((p) => p.kind === 'quad');
+const QUAD_CYCLE_MS = 30000, QUAD_READY_MS = 10000, QUAD_RAMP_MS = 6000;   // up 10s every 30s; glow-ramps 6s before
+function quadState() {
+  const ph = Date.now() % QUAD_CYCLE_MS;
+  const ready = ph < QUAD_READY_MS;
+  const secs = Math.ceil((ready ? QUAD_READY_MS - ph : QUAD_CYCLE_MS - ph) / 1000);   // ready: time left; else: time to next
+  const ramp = ready ? 1 : Math.max(0, 1 - (QUAD_CYCLE_MS - ph) / QUAD_RAMP_MS);       // 0..1 build-up before ready
+  return { ready, secs, ramp };
+}
+const QUAD_RGB = [200, 110, 255];
+
 // ---------------------------------------------------------------- airlock objective (client render only)
 // PURELY COSMETIC. The server (S2C.OBJECTIVE, 20Hz) owns every truth — who owns a
 // console, when the door opens, who wins, who is vented. This client half only
@@ -86,7 +103,16 @@ let pickupToast = { text: '', until: 0 };      // brief "PICKED UP <NAME>" banne
 // authoritative decisions (see docs/objective-contract.md).
 //   objState — latest OBJECTIVE snapshot (or welcome.objective), null on deck7.
 //   prevObj  — last snapshot, for edge-triggered SFX (arm / door-crank / vent).
-const airlock = world.airlock;                // static rect from the compiled deck (null on deathmatch)
+const airlock = world.airlock;                // static rect (a bay door, or deck7v2's core-implosion region), null on deathmatch
+// Per-arena objective THEME + TIMING (the client compiles this arena locally, so it
+// reads labels/timing straight from the data — nothing rides the wire). deck7v2 themes
+// the SAME machine as "OVERLOAD THE CORE" with a long telegraphed countdown; hangar-bay
+// omits `objective`, so these fall back to the airlock defaults.
+const OBJ_LABELS = (world.objective && world.objective.labels) || {};
+const OBJ_TIMING = {
+  DOOR_OPEN_MS: OBJECTIVE.DOOR_OPEN_MS, VENT_MS: OBJECTIVE.VENT_MS,
+  ...((world.objective && world.objective.timing) || {}),
+};
 let objState = null;
 let prevObj = null;
 // Edge-detect phase/console changes to fire one-shot SFX + FX (no per-frame spam).
@@ -861,6 +887,39 @@ function render(t) {
     }
   }
 
+  // --- THE QUAD: a telegraphed powerup pad — a tall additive purple pillar of light
+  // that is DIM while charging and blazes + pulses when READY (glow-ramp telegraph). ---
+  if (powerSpots.length) {
+    const qs = quadState();
+    const intensity = 0.18 + 0.82 * qs.ramp;                         // dim..bright over the ramp
+    const pulse = qs.ready ? (0.7 + 0.3 * Math.sin(t * 7)) : 1;
+    for (const pk of powerSpots) {
+      const relX = pk.x - ex, relY = pk.y - ey;
+      const ptx = invDet * (dirY * relX - dirX * relY);
+      const pty = invDet * (-planeY * relX + planeX * relY);
+      if (pty <= 0.25 || pty > 40) continue;
+      const sx = (SCREEN_W / 2) * (1 + ptx / pty);
+      const ccol = Math.round(sx);
+      if (ccol < 0 || ccol >= SCREEN_W || pty >= zbuf[ccol]) continue;
+      const floorY = HORIZON + (0.5 * PROJ) / pty;
+      const topY = HORIZON + ((0.5 - 1.1) * PROJ) / pty;             // a tall column of light
+      const rad = Math.max(2, ((0.5 * PROJ) / pty) * 0.5);
+      const y0q = Math.max(0, topY | 0), y1q = Math.min(SCREEN_H - 1, floorY | 0);
+      for (let X = Math.max(0, (sx - rad) | 0); X <= Math.min(SCREEN_W - 1, (sx + rad) | 0); X++) {
+        if (pty >= zbuf[X]) continue;
+        const dxn = Math.abs((X - sx) / rad);                        // 0 centre .. 1 edge
+        const beam = (1 - dxn) * (1 - dxn) * intensity * pulse;
+        for (let Y = y0q; Y <= y1q; Y++) {
+          const i = Y * SCREEN_W + X, px = fb[i];
+          fb[i] = packRGB(
+            Math.min(255, (px & 255) + QUAD_RGB[0] * beam) | 0,
+            Math.min(255, ((px >> 8) & 255) + QUAD_RGB[1] * beam) | 0,
+            Math.min(255, ((px >> 16) & 255) + QUAD_RGB[2] * beam * 1.1) | 0);
+        }
+      }
+    }
+  }
+
   octx.putImageData(img, 0, 0);
 }
 
@@ -1222,9 +1281,9 @@ Net.on(S2C.HIT, (m) => {
 });
 Net.on(S2C.KILL, (m) => {
   const nm = m.names || {};
-  // vent kills (weapon 'airlock') read as "VENTED" in the feed; normal frags stay ⟶
+  // objective kills (machine weapon 'airlock') read as "VENTED"/"OVERLOADED"; frags stay ⟶
   const text = m.weapon === 'airlock'
-    ? `${nm.by || m.by} ✦ VENTED ${nm.id || m.id}`
+    ? `${nm.by || m.by} ✦ ${OBJ_LABELS.feed || 'VENTED'} ${nm.id || m.id}`
     : `${nm.by || m.by} ⟶ ${nm.id || m.id}`;
   killfeed.push({ text, until: performance.now() + 6000 });
   if (killfeed.length > 5) killfeed.shift();
@@ -1278,12 +1337,47 @@ if (!IS_BOT) {
   addEventListener('mousedown', () => { if (document.pointerLockElement === screen) fireHeld = true; });
   addEventListener('mouseup', () => { fireHeld = false; });
   const overlay = document.getElementById('overlay');
-  overlay.addEventListener('click', () => {
+  const enter = () => {
     started = true;
     overlay.classList.add('hide');
     audioUnlocked = true;   // browsers only allow audio after a user gesture
     screen.requestPointerLock?.();
-  });
+  };
+  // background click / center-tap enters the CURRENTLY LOADED arena (this preserves
+  // every existing tap-to-enter path — verify.mjs, mobile-verify, a plain click).
+  overlay.addEventListener('click', enter);
+
+  // ---- START-SCREEN MAP PICKER (the LIGHTEST "both arenas live + selectable") ----
+  // The server is single-arena-per-process, so each deck is its own instance and the
+  // arena is chosen by URL: this menu just sets ?map= and reloads onto the matching
+  // server (net.js routes the WS by ?map=). "Player chooses when spinning up a room."
+  // Gated to the two USER arenas so dev/verify maps (hangar-bay) keep the plain screen.
+  const PICKS = [
+    { id: 'deck7-derelict', name: 'ORIGINAL', tag: 'RING OF 8 · DEATHMATCH', accent: '#3cd6ff' },
+    { id: 'deck7v2',        name: 'DECK7 · V2', tag: '5 ZONES · OVERLOAD THE CORE', accent: '#ffb03a' },
+  ];
+  if (PICKS.some((p) => p.id === world.id)) {
+    const go = (id) => {                                   // switch arena = reload with ?map=id (keeps other params)
+      const q = new URLSearchParams(location.search);
+      q.set('map', id);
+      location.search = q.toString();
+    };
+    const pick = document.createElement('div');
+    pick.id = 'arenapick';
+    for (const p of PICKS) {
+      const cur = p.id === world.id;
+      const card = document.createElement('div');
+      card.className = 'acard' + (cur ? ' cur' : '');
+      card.style.setProperty('--ac', p.accent);
+      card.innerHTML = `<div class="an">${p.name}</div><div class="at">${p.tag}</div>`
+        + `<div class="ago">${cur ? '▶ ENTER' : 'SWITCH ›'}</div>`;
+      card.addEventListener('click', (e) => { e.stopPropagation(); if (cur) enter(); else go(p.id); });
+      pick.appendChild(card);
+    }
+    const go1 = overlay.querySelector('.go');
+    if (go1) { go1.textContent = 'pick an arena — or click anywhere to enter'; go1.style.fontSize = '11px'; go1.style.border = 'none'; go1.style.opacity = '0.7'; }
+    overlay.insertBefore(pick, go1 || null);
+  }
 } else {
   document.getElementById('overlay').classList.add('hide');
 }
@@ -1383,7 +1477,7 @@ function frame(now) {
     if (objState && airlock) {
       const ph = objState.phase, tot = objState.total || 1;
       if (ph === 'arming') doorTarget = 0.06 + 0.22 * ((objState.armedCount || 0) / tot);   // cracks as consoles arm
-      else if (ph === 'opening') { const fr = objState.timer != null ? 1 - objState.timer / OBJECTIVE.DOOR_OPEN_MS : 1; doorTarget = 0.3 + 0.7 * Math.max(0, Math.min(1, fr)); }
+      else if (ph === 'opening') { const fr = objState.timer != null ? 1 - objState.timer / OBJ_TIMING.DOOR_OPEN_MS : 1; doorTarget = 0.3 + 0.7 * Math.max(0, Math.min(1, fr)); }
       else if (ph === 'venting') doorTarget = 1;           // idle stays 0 (shut)
     }
     cam.door += (doorTarget - cam.door) * Math.min(1, dt * 3.2);
@@ -1391,7 +1485,7 @@ function frame(now) {
     const venting = !!(objState && objState.phase === 'venting');
     const iAmWinner = venting && objState.winner && objState.winner.id === me.id;
     if (venting && airlock) {
-      const ramp = objState.timer != null ? Math.max(0, Math.min(1, 1 - objState.timer / OBJECTIVE.VENT_MS)) : 1;
+      const ramp = objState.timer != null ? Math.max(0, Math.min(1, 1 - objState.timer / OBJ_TIMING.VENT_MS)) : 1;
       const ap = airlockPull();
       const dx = ap.cx - me.x, dy = ap.cy - me.y, L = Math.hypot(dx, dy) || 1;
       const camMax = iAmWinner ? 0.14 : 1.15;              // the holder braces; everyone else is sucked out
@@ -1517,6 +1611,19 @@ function updateHUD() {
   // objective banner (only on objective decks — deck7 deathmatch stays blank)
   updateObjectiveHUD();
   const vf = $('ventflash'); if (vf) vf.style.opacity = cam.ventFlash * 0.55;
+
+  // THE QUAD telegraph clock (only on decks with a quad — deck7v2)
+  const qc = $('quadclock');
+  if (qc) {
+    if (!powerSpots.length) qc.style.display = 'none';
+    else {
+      const qs = quadState();
+      qc.style.display = 'block';
+      qc.className = 'hud' + (qs.ready ? ' ready' : '');
+      const mm = Math.floor(qs.secs / 60), ss = String(qs.secs % 60).padStart(2, '0');
+      qc.textContent = qs.ready ? `◈ QUAD  UP · ${mm}:${ss}` : `◈ QUAD  ${mm}:${ss}`;
+    }
+  }
 }
 
 // The objective HUD: phase label, consoles armedCount/total with per-owner pips,
@@ -1527,23 +1634,31 @@ function updateObjectiveHUD() {
   el.style.display = 'block';
   const o = objState, tot = o.total || 0, armed = o.armedCount || 0;
   const secs = o.timer != null ? Math.max(0, Math.ceil(o.timer / 1000)) : null;
+  // themed labels (deck7v2 -> OVERLOAD; airlock defaults otherwise)
+  const L = OBJ_LABELS;
   let phaseTxt, sub, cls = '';
-  if (o.phase === 'opening') { phaseTxt = 'DEFEND THE AIRLOCK'; sub = secs != null ? `DOOR OPENING · ${secs}s` : 'DOOR OPENING'; cls = 'warn'; }
-  else if (o.phase === 'venting') {
+  if (o.phase === 'opening') {
+    phaseTxt = L.defend || 'DEFEND THE AIRLOCK';
+    sub = `${L.defendSub || 'DOOR OPENING'}${secs != null ? ` · ${secs}s` : ''}`;
+    cls = 'warn';
+  } else if (o.phase === 'venting') {
     const w = o.winner;
-    phaseTxt = w ? `${w.name} WINS` : 'THE VOID WINS';
-    sub = secs != null ? `VENTING · ${secs}s` : 'VENTING';
+    phaseTxt = w ? `${w.name} ${L.win || 'WINS'}` : (L.voidWin || 'THE VOID WINS');
+    sub = `${L.winSub || 'VENTING'}${secs != null ? ` · ${secs}s` : ''}`;
     cls = 'vent';
     if (w && w.color) el.style.setProperty('--win', w.color);
-  } else { phaseTxt = 'ARM THE CONSOLES'; sub = `CONSOLES ${armed}/${tot}`; }
+  } else { phaseTxt = L.arm || 'ARM THE CONSOLES'; sub = `${L.armSub || 'CONSOLES'} ${armed}/${tot}`; }
   const pips = (o.consoles || []).map((c) => {
     const col = c.armed && c.color ? c.color : (c.owner != null && c.color ? c.color : '#3a4a52');
     const fill = c.armed ? 1 : Math.max(0, Math.min(1, c.progress || 0));
     return `<span class="pip" style="border-color:${col};box-shadow:0 0 5px ${c.armed ? col : 'transparent'}">`
       + `<i style="background:${col};height:${Math.round(fill * 100)}%"></i></span>`;
   }).join('');
+  // action prompt: teach the loop while there's still a console to grab (idle/arming)
+  const showPrompt = (o.phase === 'idle' || o.phase === 'arming') && armed < tot && L.pad;
+  const prompt = showPrompt ? `<div class="prompt">${L.pad}</div>` : '';
   el.className = 'hud ' + cls;
-  el.innerHTML = `<div class="phase">${phaseTxt}</div><div class="sub">${sub}</div><div class="pips">${pips}</div>`;
+  el.innerHTML = `<div class="phase">${phaseTxt}</div><div class="sub">${sub}</div><div class="pips">${pips}</div>${prompt}`;
 }
 
 // ---------------------------------------------------------------- boot
@@ -1571,6 +1686,9 @@ window.__game = {
   snapshot() { return [...Net.players.values()]; }, // authoritative view of all players
   counts() { return { particles: particles.length, splats: splats.length, bolts: bolts.length }; }, // QA: feel-fx liveness
   get objective() { return objState; },             // QA: server objective snapshot (null on deathmatch)
+  get objLabels() { return OBJ_LABELS; },           // QA: themed objective labels for this deck
+  get quad() { return powerSpots.length ? { ...quadState(), spots: powerSpots.length } : null; }, // QA: THE QUAD telegraph state
+  get mapId() { return world.id; },                 // QA: which arena this client compiled
   get door() { return cam.door; },                  // QA: bay-door crank 0..1
   get ventPull() { return [+cam.ventOffX.toFixed(3), +cam.ventOffY.toFixed(3)]; }, // QA: render-only vent camera offset
   get weapon() { return me.weapon; },               // QA: current authoritative weapon key

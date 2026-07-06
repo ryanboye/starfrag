@@ -32,6 +32,11 @@ const HOST = process.env.STARFRAG_HOST || '127.0.0.1';
 // 'hangar-bay'); unset → the default derelict deck. Rotation is a future feature.
 const arena = pickArena(process.env.STARFRAG_MAP);
 const map = compileMap(arena);       // { W, H, grid, spawns, ... }
+// The objective STATE MACHINE is generic; a deck may override its DURATIONS (and
+// theme) via `arena.objective` (see deck7v2 — a long DOOR_OPEN_MS = the telegraphed
+// OVERLOAD countdown). Defaults to the shared OBJECTIVE, so hangar-bay is unchanged.
+const OBJT = { ...OBJECTIVE, ...((arena.objective && arena.objective.timing) || {}) };
+const OBJ_MODE = (arena.objective && arena.objective.mode) || OBJECTIVE.MODE;
 const players = new Map();           // id -> player record
 let nextId = 1;
 let colorIx = 0;
@@ -173,7 +178,7 @@ function updatePickups(now) {
 // Public objective snapshot for the wire — the client renders exactly this.
 function objectiveView(now) {
   return {
-    mode: OBJECTIVE.MODE,
+    mode: OBJ_MODE,
     phase: OBJ.phase,
     total: OBJ.consoles.length,
     armedCount: OBJ.consoles.filter((c) => c.armed).length,
@@ -219,8 +224,8 @@ function ventTheDeck(now) {
 function updateObjective(now) {
   if (!OBJ) return;
   if (OBJ.phase === 'idle' || OBJ.phase === 'arming') {
-    const rate = (1000 / TICK_HZ) / OBJECTIVE.ARM_MS;
-    const R2 = OBJECTIVE.ARM_RADIUS * OBJECTIVE.ARM_RADIUS;
+    const rate = (1000 / TICK_HZ) / OBJT.ARM_MS;
+    const R2 = OBJT.ARM_RADIUS * OBJT.ARM_RADIUS;
     for (const c of OBJ.consoles) {
       let near = null, nCount = 0;
       for (const p of players.values()) {
@@ -243,10 +248,10 @@ function updateObjective(now) {
     const armed = OBJ.consoles.filter((c) => c.armed).length;
     OBJ.phase = armed > 0 ? 'arming' : 'idle';
     if (OBJ.consoles.length > 0 && armed === OBJ.consoles.length) {
-      OBJ.phase = 'opening'; OBJ.phaseUntil = now + OBJECTIVE.DOOR_OPEN_MS;   // lock in; door cranks open
+      OBJ.phase = 'opening'; OBJ.phaseUntil = now + OBJT.DOOR_OPEN_MS;   // lock in; door cranks open (v2: overload countdown)
     }
   } else if (OBJ.phase === 'opening') {
-    if (now >= OBJ.phaseUntil) { OBJ.phase = 'venting'; OBJ.phaseUntil = now + OBJECTIVE.VENT_MS; ventTheDeck(now); }
+    if (now >= OBJ.phaseUntil) { OBJ.phase = 'venting'; OBJ.phaseUntil = now + OBJT.VENT_MS; ventTheDeck(now); }
   } else if (OBJ.phase === 'venting') {
     if (now >= OBJ.phaseUntil) resetObjective();
   }

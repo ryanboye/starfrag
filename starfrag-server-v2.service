@@ -1,0 +1,28 @@
+# STARFRAG — SECOND arena instance (DECK7 V2 "REACTOR OVERLOAD").
+#
+# The server is single-arena-per-process (STARFRAG_MAP selects the deck), so running
+# deck7v2 LIVE ALONGSIDE the original deck is just a second instance on its own port.
+# The client's start-screen map picker sets ?map=, and net.js routes the WebSocket to
+# the matching instance (deck7v2 -> /starfrag-v2-ws -> 127.0.0.1:8792).
+#
+# Deploy (after the branch merges into the live /home/claudebot/starfrag worktree):
+#   cp starfrag-server-v2.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now starfrag-server-v2
+# then add the Caddy route (see docs/deploy-v2.md) and reload Caddy.
+
+[Unit]
+Description=STARFRAG authoritative arena server — DECK7 V2 (reactor overload)
+After=network.target
+
+[Service]
+Environment=STARFRAG_PORT=8792
+Environment=STARFRAG_MAP=deck7v2
+Environment=STARFRAG_HOST=127.0.0.1
+Environment=NODE_PATH=/home/claudebot/node_modules
+WorkingDirectory=/home/claudebot/starfrag
+ExecStart=/usr/bin/node /home/claudebot/starfrag/server/server.mjs
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -5,11 +5,18 @@ import { C2S, S2C } from '../shared/protocol.js';
 
 function wsUrl() {
   const q = new URLSearchParams(location.search);
-  if (q.get('ws')) return q.get('ws');                 // explicit override for local dev
+  if (q.get('ws')) return q.get('ws');                 // explicit override for local dev / verify
+  // MAP -> INSTANCE routing: each arena runs as its OWN one-arena server (the server
+  // is single-arena per process, selected by STARFRAG_MAP). deck7v2 is a second
+  // instance; every other arena uses the original one. The start-screen map picker
+  // sets ?map=, which lands the client on the matching server. (Deploy: a second
+  // systemd unit STARFRAG_MAP=deck7v2 STARFRAG_PORT=8792 + a Caddy /starfrag-v2-ws
+  // route — see starfrag-server-v2.service + docs/deploy-v2.md.)
+  const v2 = q.get('map') === 'deck7v2';
   const h = location.hostname;
-  if (h === 'localhost' || h === '127.0.0.1') return `ws://${h}:8791`;
+  if (h === 'localhost' || h === '127.0.0.1') return `ws://${h}:${v2 ? 8792 : 8791}`;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${proto}//${location.host}/starfrag-ws`;      // Caddy reverse-proxies this
+  return `${proto}//${location.host}/${v2 ? 'starfrag-v2-ws' : 'starfrag-ws'}`;   // Caddy reverse-proxies these
 }
 
 export const Net = {
