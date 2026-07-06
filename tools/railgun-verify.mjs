@@ -15,6 +15,7 @@ import { spawn } from 'child_process';
 import { mkdirSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { join } from 'path';
+import { WebSocket } from 'ws';
 
 const ROOT = join(fileURLToPath(new URL('.', import.meta.url)), '..');
 const DOCS = join(ROOT, 'docs');
@@ -28,22 +29,46 @@ const PAD = { x: 16, y: 13, ang: Math.PI / 2 };   // railgun pickup on deck7 (sh
 const procs = [];
 const spawnProc = (cmd, args, env) => {
   const p = spawn(cmd, args, { cwd: ROOT, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
-  p.stderr.on('data', (d) => process.env.RG_DEBUG && process.stderr.write(`[${args[0]}] ${d}`));
+  let err = '';
+  p.stderr.on('data', (d) => { err += d; process.env.RG_DEBUG && process.stderr.write(`[${args[0]}] ${d}`); });
+  // a leftover orphan on the port makes the arena die with EADDRINUSE — surface it, don't
+  // silently let the browser connect to the orphan (that was a real debugging trap).
+  p.on('exit', (code) => { if (code) { p._died = /EADDRINUSE/.test(err) ? `port ${err.match(/:(\d+)/)?.[1] || '?'} in use (orphan?)` : `exit ${code}`; } });
   procs.push(p); return p;
 };
 const cleanup = () => { for (const p of procs) try { p.kill('SIGKILL'); } catch {} };
+// clean up children even when `timeout` (or Ctrl-C) SIGKILLs us mid-run — else orphans pile up
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { cleanup(); process.exit(130); });
+// confirm the ARENA we spawned is the one answering (raw-WS WELCOME), not a stale orphan
+async function arenaReady(arena) {
+  for (let i = 0; i < 50; i++) {
+    if (arena._died) throw new Error('arena failed to start: ' + arena._died);
+    const got = await new Promise((res) => {
+      const ws = new WebSocket(WS_URL);
+      const done = (v) => { try { ws.close(); } catch {} res(v); };
+      ws.on('open', () => ws.send(JSON.stringify({ t: 'join', name: 'probe' })));
+      ws.on('message', (b) => { try { done(JSON.parse(b).t === 'welcome'); } catch { done(false); } });
+      ws.on('error', () => done(false));
+      setTimeout(() => done(false), 400);
+    });
+    if (got) return;
+    await sleep(150);
+  }
+  throw new Error('arena never answered on ' + WS_URL);
+}
 
 const results = {};
 let browser;
 try {
   spawnProc('node', ['tools/static.mjs'], { PORT: String(STATIC_PORT) });
-  spawnProc('node', ['server/server.mjs'], { STARFRAG_PORT: String(WS_PORT), STARFRAG_HOST: '127.0.0.1', STARFRAG_MAP: 'deck7-derelict' });
+  const arena = spawnProc('node', ['server/server.mjs'], { STARFRAG_PORT: String(WS_PORT), STARFRAG_HOST: '127.0.0.1', STARFRAG_MAP: 'deck7-derelict' });
   // poll the static server until it answers (readiness beats a fixed sleep)
   for (let i = 0; i < 40; i++) {
     try { const r = await fetch(`http://localhost:${STATIC_PORT}/index.html`); if (r.ok) break; } catch {}
     if (i === 39) throw new Error('static server never came up on ' + STATIC_PORT);
     await sleep(150);
   }
+  await arenaReady(arena);   // hard-fail if an orphan holds the arena port
 
   browser = await chromium.launch({
     headless: true,
