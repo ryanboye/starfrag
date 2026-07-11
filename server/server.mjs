@@ -233,20 +233,26 @@ function pickupsView() {
   return v;
 }
 
-// Apply an instant item's effect. Returns true if it was actually consumed (a full-HP
-// player walking over a health pad leaves it for someone who needs it — classic).
+// Apply an instant item's effect. Returns false if it had NO effect (a full-HP player walks
+// over a health pad and leaves it for someone who needs it — classic), else a result object
+// { traded } where traded==='quad' means grabbing this DEFENSIVE (armor plates / mega overheal)
+// SPENT a live quad. THE SYMMETRIC TRADE: a body holds quad OR a defensive, never both — taking
+// one ENDS the other. Plain +health and ammo are neutral (never touch the quad).
 function applyItem(p, pk, now) {
   if (pk.kind === 'health') {
     const max = pk.mega ? POWERUP.MEGA_MAX : POWERUP.HEALTH_MAX;
     const add = pk.mega ? POWERUP.MEGA_ADD : POWERUP.HEALTH_ADD;
     if (p.hp >= max) return false;
     p.hp = Math.min(max, p.hp + add);
-    return true;
+    // mega overheal IS a defensive — grabbing it while quad is live spends the quad. Plain +25 is not.
+    if (pk.mega && p.quadUntil > now) { p.quadUntil = 0; return { traded: 'quad' }; }
+    return { traded: null };
   }
   if (pk.kind === 'armor') {
     if (p.armor >= POWERUP.ARMOR_MAX) return false;
     p.armor = Math.min(POWERUP.ARMOR_MAX, p.armor + POWERUP.ARMOR_ADD);
-    return true;
+    if (p.quadUntil > now) { p.quadUntil = 0; return { traded: 'quad' }; }   // armor is a defensive — spends a live quad
+    return { traded: null };
   }
   if (pk.kind === 'ammo') {
     const wp = WEAPONS[p.weapon] || WEAPONS[DEFAULT_WEAPON];
@@ -254,7 +260,7 @@ function applyItem(p, pk, now) {
     p.clips[p.weapon] = wp.clip;
     p.reloadUntil = 0;                                        // a fresh mag cancels a reload
     sendWeapon(p);
-    return true;
+    return { traded: null };                                 // ammo is neutral — never interacts with the quad
   }
   return false;
 }
@@ -288,7 +294,8 @@ function updatePickups(now) {
       if (!p.joined || p.dead) continue;
       const dx = p.x - pk.x, dy = p.y - pk.y;
       if (dx * dx + dy * dy > IPICK_R2) continue;
-      if (!applyItem(p, pk, now)) continue;   // no effect (already capped) → leave the pad up
+      const res = applyItem(p, pk, now);
+      if (!res) continue;   // no effect (already capped) → leave the pad up
       pk.taken = true;
       // ANTI-PHASING: armor + mega-health (the survivability items) respawn LOCKED to the quad's
       // wall-clock cycle, offset a HALF cycle — the quad's anti-phase point — so fresh plates are
@@ -300,7 +307,8 @@ function updatePickups(now) {
         ? nextDefensiveRespawn(now + ITEM_RESPAWN_MS)
         : now + ITEM_RESPAWN_MS;
       broadcast({ t: S2C.PICKUP, id: pk.id, taken: true });
-      broadcast({ t: S2C.POWERUP, kind: pk.mega ? 'mega' : pk.kind, id: pk.id, by: p.id });
+      // `traded:'quad'` when this defensive grab spent a live quad (client toast + trade cue).
+      broadcast({ t: S2C.POWERUP, kind: pk.mega ? 'mega' : pk.kind, id: pk.id, by: p.id, ...(res.traded ? { traded: res.traded } : {}) });
       break;
     }
   }
@@ -319,10 +327,20 @@ function updatePickups(now) {
         const dx = p.x - quad.x, dy = p.y - quad.y;
         if (dx * dx + dy * dy > IPICK_R2) continue;
         p.quadUntil = now + QUAD_MS;                  // grant / refresh
+        // THE SYMMETRIC TRADE: taking the quad SPENDS any live defensive on this body — armor
+        // strips to 0 and mega overheal clamps to 100. A body holds quad OR a defensive, never
+        // both, so the "grab armor first, quad second" stacking order is now closed too.
+        let traded = null;
+        if (p.armor > 0 || p.hp > POWERUP.HEALTH_MAX) {
+          p.armor = 0;
+          if (p.hp > POWERUP.HEALTH_MAX) p.hp = POWERUP.HEALTH_MAX;
+          traded = 'defensive';
+        }
         quad.taken = true;
         quadDarkUntil = QUAD_ALWAYS ? now + 1500 : nextCycleStart(now);   // dark till the next telegraph window (live)
         broadcast({ t: S2C.PICKUP, id: quad.id, taken: true });
-        broadcast({ t: S2C.POWERUP, kind: 'quad', id: quad.id, by: p.id });
+        // `traded:'defensive'` when this quad grab spent live armor/overheal (client toast + trade cue).
+        broadcast({ t: S2C.POWERUP, kind: 'quad', id: quad.id, by: p.id, ...(traded ? { traded } : {}) });
         break;
       }
     }

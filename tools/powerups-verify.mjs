@@ -53,23 +53,24 @@ try {
   };
   await park();
 
-  // wait for a telegraph window + the server grant (camp on the pad so we beat the bots);
-  // retry across windows for up to ~75s in case a bot grabs it first.
-  const deadline = Date.now() + 75000;
-  let got = false;
-  while (Date.now() < deadline && !got) {
-    await park();
-    const ready = await C.evaluate(() => __game.quad && __game.quad.ready);
-    if (ready) {
-      for (let i = 0; i < 20 && !got; i++) {           // hold on the pad through a few ticks
-        await park(); await sleep(150);
-        got = await C.evaluate(() => (__game.quadMs || 0) > 0);
+  // Camp the carrier on the quad pad through a telegraph window and grab it; retry across windows
+  // (beat the bots) up to `deadlineMs`. Returns the ms of quad the carrier ended up holding (0 = never).
+  async function grabQuad(deadlineMs = 75000) {
+    const deadline = Date.now() + deadlineMs;
+    while (Date.now() < deadline) {
+      await park();
+      if (await C.evaluate(() => __game.quad && __game.quad.ready)) {
+        for (let i = 0; i < 20; i++) {
+          await park(); await sleep(150);
+          if (await C.evaluate(() => (__game.quadMs || 0) > 0)) return C.evaluate(() => __game.quadMs || 0);
+        }
       }
+      await sleep(400);
     }
-    if (!got) await sleep(400);
+    return C.evaluate(() => __game.quadMs || 0);
   }
-  results.carrierQuadMs = await C.evaluate(() => __game.quadMs || 0);
-  results.grabbed = got;
+  results.carrierQuadMs = await grabQuad();
+  results.grabbed = results.carrierQuadMs > 0;
 
   // let a couple of STATE frames land so the viewer sees the carrier's quad flag + tint
   await sleep(500);
@@ -83,10 +84,66 @@ try {
   await C.screenshot({ path: join(DOCS, 'powerup-quad-holder-hud.png') });   // carrier POV: QUAD DAMAGE countdown HUD
   await V.screenshot({ path: join(DOCS, 'powerup-quad-carrier-tint.png') });  // viewer sees the carrier tinted purple
 
+  // ---- THE SYMMETRIC TRADE (live) — the quad-carrier walks onto an armor pad. Armor must apply
+  // AND the quad must END the instant it lands (a body holds quad OR a defensive, never both):
+  // the "◈ QUAD SPENT — ARMOR UP" toast fires, the holder clock clears, and every viewer's purple
+  // tint drops (carrier.quad -> 0). The toast is the DEFINITIVE proof it's a trade, not expiry.
+  //
+  // The doc screenshots above are ~10s each under swiftshader and expired the first quad, so
+  // RE-GRAB a fresh quad here (right before the trade) and keep the trade path screenshot-free
+  // until the toast is captured — otherwise the 22s quad bleeds out before the armor grab.
+  results.preTradeQuadMs = await grabQuad();
+  await C.evaluate(() => __game.teleport(2.5, 12.5, -1.57));        // step off the quad pad before heading for the defensive
+  // deck7v2 defensives: the armor pad (dock, S) is the target; the mega pad (cargo) is a fallback
+  // if a bot is camping armor. Either spends the quad — both toasts match /QUAD SPENT/.
+  const DEF_COORD = { 'pickup-dock-armor': [17.5, 28.5], 'pickup-cargo-mega': [25.5, 13.5] };
+  const hasDef = () => C.evaluate(() => (__game.armor || 0) > 0 || (__game.hp || 0) > 100);
+  let tradeToast = '', tGrab = 0, shot = false;
+  const t0Trade = Date.now(), tEnd = t0Trade + 15000;
+  while (Date.now() < tEnd && !(await hasDef())) {
+    const pad = await C.evaluate((coord) => {                       // prefer an available ARMOR pad; fall back to mega
+      const up = __game.items().filter((it) => !it.taken && coord[it.id]);
+      const a = up.find((it) => it.kind === 'armor') || up.find((it) => it.kind === 'mega');
+      return a ? { id: a.id, kind: a.kind, x: coord[a.id][0], y: coord[a.id][1] } : null;
+    }, DEF_COORD);
+    if (pad) { results.defPad = pad; await C.evaluate((p) => __game.teleport(p.x, p.y, 0), pad); }
+    await sleep(120);
+    const t = await C.evaluate(() => __game.toast || '');           // catch the toast the instant it fires
+    if (/QUAD SPENT/.test(t)) {
+      tradeToast = t; if (!tGrab) tGrab = Date.now();
+      // grab the proof shot NOW while the toast is still on the HUD (it lasts ~2.2s; the screenshot
+      // captures the current frame even though swiftshader takes ~10s to encode+return).
+      if (!shot) { shot = true; await C.screenshot({ path: join(DOCS, 'powerup-trade-toast.png') }); }  // "◈ QUAD SPENT — …" + armor/HP HUD up
+    }
+  }
+  // the grab may have landed on the loop's exit check — re-poll the toast through the rest of its ~2.2s life
+  for (let i = 0; i < 14 && !tradeToast; i++) {
+    const t = await C.evaluate(() => __game.toast || '');
+    if (/QUAD SPENT/.test(t)) { tradeToast = t; if (!tGrab) tGrab = Date.now(); if (!shot) { shot = true; await C.screenshot({ path: join(DOCS, 'powerup-trade-toast.png') }); } }
+    await sleep(120);
+  }
+  await sleep(400);                                                 // let a STATE frame land so quad->0 reaches the viewer
+  results.postTradeArmor = await C.evaluate(() => __game.armor || 0);
+  results.postTradeHp = await C.evaluate(() => __game.hp || 0);
+  results.postTradeQuadMs = await C.evaluate(() => __game.quadMs || 0);
+  results.tradeToast = tradeToast;                                   // transient DOM toast (best-effort; may be overwritten)
+  results.lastTrade = await C.evaluate(() => __game.lastTrade);      // sticky trade record — the robust proof
+  results.tradeLatencyMs = tGrab ? tGrab - t0Trade : null;          // quad-grab -> trade fire; well under the 22s quad life
+  results.holderClockAfter = await C.evaluate(() => (document.getElementById('quadclock') || {}).textContent || '');
+  results.viewerSeesQuadAfter = await V.evaluate((id) => {
+    const c = __game.snapshot().find((p) => p.id === id); return c ? (c.quad || 0) : -1;
+  }, myId);
+
+  results.tradeFired = results.preTradeQuadMs > 0 && (results.postTradeArmor > 0 || results.postTradeHp > 100) && results.postTradeQuadMs === 0;
+  // definitive: the client fired a SYMMETRIC-TRADE toast (traded a live quad for the defensive) — expiry/death produce none
+  results.tradeToastOk = !!(results.lastTrade && results.lastTrade.traded === 'quad' && /QUAD SPENT/.test(results.lastTrade.text));
+  results.tradeTintDropped = results.viewerSeesQuadAfter === 0;      // the purple tint dropped for other players
+
   results.pass = results.mapId === 'deck7v2' && results.hasQuadTelegraph
     && results.grabbed && results.carrierQuadMs > 0
     && results.viewerSeesCarrierQuad > 0
-    && /QUAD DAMAGE/.test(results.holderClock);
+    && /QUAD DAMAGE/.test(results.holderClock)
+    && results.tradeFired && results.tradeToastOk && results.tradeTintDropped;
   console.log('\n=== STARFRAG POWERUP LIVE VERIFY ===');
   console.log(JSON.stringify(results, null, 2));
   await browser.close();

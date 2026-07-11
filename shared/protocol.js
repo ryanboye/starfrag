@@ -138,15 +138,16 @@ export const POWERUP = {
   PICKUP_RADIUS: 0.75,            // walk this close (cells) to grab an item — matches weapons
 };
 
-// --- DEFENSIVE-PAD ANTI-PHASING (armor + mega-health) -----------------------
-// The QUAD telegraph is a wall-clock cycle: it's fresh/READY for QUAD_READY_MS at the top of
-// every QUAD_CYCLE_MS (the server grab-gate + the client telegraph both read this same clock).
-// The DEFENSIVE items (armor plates + mega-health overheal) are the survivability grabs, and
-// quad + one of them on the same body (⅔ absorb behind a big damage mult) is near-unkillable.
-// A plain free-run respawn drifts INTO phase with the quad cycle, so those two power spikes keep
-// co-refreshing. Instead the server locks the defensive respawn to the quad clock, offset a HALF
-// cycle — the quad's ANTI-PHASE point — so fresh plates are NEVER on the floor during the quad's
-// READY window. These pure helpers are the single source of that math (server + tests import them).
+// --- DEFENSIVE-PAD ANTI-PHASING (armor + mega-health) — SPAWN RHYTHM ---------
+// NOTE: quad×defensive stacking is now closed by THE SYMMETRIC TRADE (see applyItem + the quad
+// grab in server.mjs): a body holds quad OR a defensive, never both, so grabbing either while the
+// other is live ENDS the other. That trade — not this spawn schedule — is the actual invariant.
+// Anti-phasing is KEPT purely as good spawn CADENCE: the DEFENSIVE items (armor plates + mega-
+// health overheal) respawn locked to the quad clock, offset a HALF cycle (the quad's anti-phase
+// point), so a fresh defensive and a fresh quad don't both land on the floor at the same instant —
+// nicer contest rhythm, no longer load-bearing. These pure helpers are the single source of that
+// math (server + tests import them). The quad telegraph is a wall-clock cycle: it's fresh/READY
+// for QUAD_READY_MS at the top of every QUAD_CYCLE_MS (server grab-gate + client telegraph agree).
 export const QUAD_HALF_CYCLE_MS = POWERUP.QUAD_CYCLE_MS / 2;
 // Is the quad telegraph fresh/READY at wall-clock time t?
 export function quadReadyAt(t) { return (((t % POWERUP.QUAD_CYCLE_MS) + POWERUP.QUAD_CYCLE_MS) % POWERUP.QUAD_CYCLE_MS) < POWERUP.QUAD_READY_MS; }
@@ -183,7 +184,10 @@ export const S2C = {
   SHOT:    'shot',    // { id, ang, weapon, charge? }  -> muzzle flash on `id`; charge (0..1) present for the railgun -> beam intensity
   WEAPON:  'weapon',  // { weapon, clip, owned:[keys] }  -> YOUR authoritative weapon/ammo changed
   PICKUP:  'pickup',  // { id, taken }         -> a map pickup pad (weapon/item/quad) became (un)available
-  POWERUP: 'powerup', // { kind, id, by }      -> `by` grabbed a sustain/quad item (cue + toast; hp/armor/quad land via STATE)
+  POWERUP: 'powerup', // { kind, id, by, traded? } -> `by` grabbed a sustain/quad item (cue + toast; hp/armor/quad land via STATE).
+                      //   traded='quad'      : this DEFENSIVE grab (armor/mega) spent a live quad -> "QUAD SPENT — <buff> UP"
+                      //   traded='defensive' : this QUAD grab spent live armor/overheal          -> "PLATES SPENT — QUAD DAMAGE"
+                      //   (THE SYMMETRIC TRADE — a body holds quad OR a defensive, never both.)
   HIT:     'hit',     // { id, by, dmg, hp, armor }  -> player `id` took damage from `by` (armor = their remaining plates)
   KILL:    'kill',    // { id, by, weapon, names:{id,by} }  -> killfeed entry
   SPAWN:   'spawn',   // { id, x, y, ang }     -> player (re)spawned

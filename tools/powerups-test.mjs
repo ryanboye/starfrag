@@ -10,7 +10,9 @@
 //            an AMMO pad tops off the current magazine;                       [ammo]
 //            baseline carbine damage is the un-multiplied roll (kill-time);   [baseline]
 //            the QUAD multiplies a hit ~3x SERVER-side (dmg > the base cap);  [quad]
-//            the QUAD EXPIRES on the server clock (damage returns to base).   [expiry]
+//            the QUAD EXPIRES on the server clock (damage returns to base);   [expiry]
+//            THE SYMMETRIC TRADE: quad OR a defensive, never both — grabbing  [trade]
+//            either while the other is live ENDS the other (both grab orders).
 //
 // The server exposes test-only env knobs (unset in prod) so this runs in ~15s instead of
 // waiting out the live 25s/22s/30s clocks: STARFRAG_QUAD_ALWAYS (grabbable now),
@@ -19,7 +21,7 @@
 //   Run: node tools/powerups-test.mjs      (spawns its own deck7v2 server on a test port)
 import { WebSocket } from 'ws';
 import { spawn } from 'child_process';
-const { WEAPONS, C2S, POWERUP, nextDefensiveRespawn, quadReadyAt, QUAD_HALF_CYCLE_MS } = await import('../shared/protocol.js');
+const { WEAPONS, C2S, POWERUP } = await import('../shared/protocol.js');
 
 const PORT = 8798, HOST = '127.0.0.1', WS = `ws://${HOST}:${PORT}`;
 // QUAD_MS is bumped past the live 22s only to shorten the EXPIRY wait; 3s also gives the charge-
@@ -51,6 +53,7 @@ function connect(name) {
     const ws = new WebSocket(WS);
     const c = {
       ws, id: null, weapon: null, clip: 0, hits: [], kills: [], pickups: [], powerups: [],
+      selfHist: [],        // every STATE frame for THIS client { at, quad, armor, hp } — the duration-overlap scan feed
       states: new Map(),   // id -> latest public state (hp/armor/quad/dead) from STATE broadcasts
       send: (m) => ws.readyState === 1 && ws.send(JSON.stringify(m)),
       move: (x, y, ang = 0) => c.send({ t: C2S.MOVE, x, y, ang, moving: 0 }),
@@ -66,7 +69,7 @@ function connect(name) {
       else if (m.t === 'kill') c.kills.push(m);
       else if (m.t === 'pickup') c.pickups.push({ ...m, at: Date.now() });
       else if (m.t === 'powerup') c.powerups.push({ ...m, at: Date.now() });
-      else if (m.t === 'state') for (const p of m.players) c.states.set(p.id, p);
+      else if (m.t === 'state') for (const p of m.players) { c.states.set(p.id, p); if (p.id === c.id) c.selfHist.push({ at: Date.now(), quad: p.quad || 0, armor: p.armor || 0, hp: p.hp || 0 }); }
     });
   });
 }
@@ -94,6 +97,17 @@ async function freshQuad(A) {
     await sleep(200);
   }
   return (st(A, A.id).quad || 0) > 0;
+}
+// park on a sustain pad until the server broadcasts a fresh grab of `kind` for us — retries
+// across the (shortened) respawn dark window so a grab reliably lands even if the pad just went
+// dark. Returns true on a fresh grab. (armor/mega/ammo pads broadcast S2C.POWERUP kind+by.)
+async function grabDefensive(A, pad, kind, maxMs = 2800) {
+  const n = A.powerups.length, end = Date.now() + maxMs;
+  while (Date.now() < end) {
+    A.move(pad[0], pad[1]); await sleep(70);
+    if (A.powerups.slice(n).some((p) => p.kind === kind && p.by === A.id)) return true;
+  }
+  return A.powerups.slice(n).some((p) => p.kind === kind && p.by === A.id);
 }
 // walk onto a weapon pad until the server grants+switches to it (movement is client-auth here)
 async function grabWeapon(A, x, y, key) {
@@ -267,21 +281,83 @@ async function main() {
     const bs = st(A, B.id);
     ok(bs.dead === false && (bs.hp || 0) > 0, `QUADxARMOR: armored B SURVIVES one quad carbine hit (hp ${bs.hp}, armor ${bs.armor})`); }
 
-  // ---- (d) PAD PHASE (clock simulation) — the anti-god-combo lever. Across a full quad cycle,
-  //         the defensive (armor/mega) pad's computed respawn must land on the quad's ANTI-PHASE
-  //         slot and NEVER inside the READY window, so fresh plates never co-refresh with a fresh
-  //         quad. Pure math over the shared clock — no wall-clock wait needed. -----------------
-  { const cyc = POWERUP.QUAD_CYCLE_MS;
-    let inReady = 0, aligned = 0, samples = 0;
-    for (let g = 0; g < cyc; g += 250) {                           // simulate a grab every 250ms across a cycle
-      const t = nextDefensiveRespawn(g + ITEM_RESPAWN_MS);         // respawn after a base dark window
-      samples++;
-      if (quadReadyAt(t)) inReady++;
-      if ((((t % cyc) + cyc) % cyc) === QUAD_HALF_CYCLE_MS) aligned++;
+  // ============================================================================================
+  // THE SYMMETRIC TRADE — the ACTUAL invariant (replaces the old pad-phase-only case). A body
+  // holds QUAD or a DEFENSIVE (armor plates / mega overheal), never both: grabbing either while
+  // the other is live ENDS the other. We assert the TRUE runtime rule — duration overlap, not
+  // spawn windows — by scanning every authoritative STATE frame, and prove the trade fires (and
+  // announces itself) in BOTH grab orders. A is our subject (never takes fire here).
+  // ============================================================================================
+
+  // ---- (d) DURATION-OVERLAP INVARIANT — drive A through quad↔defensive grabs at varied gaps
+  //         spanning the quad life, in BOTH orders, across BOTH defensive kinds, while sampling
+  //         A's authoritative STATE every tick; assert ZERO frames ever show a double-buff
+  //         (never quad>0 while armor>0 or hp>100). Structural — holds regardless of spawn timing.
+  await waitRespawn(A, B.id);
+  A.selfHist.length = 0;                                            // only frames from here on count
+  { const gaps = [0, 900, 2000];                                   // ms between the 1st and 2nd grab — spans the 3s quad life
+    const defs = [{ pad: PADS.armor, kind: 'armor' }, { pad: PADS.mega, kind: 'mega' }];
+    for (const gap of gaps) for (const d of defs) {
+      // order 1: QUAD first, then the DEFENSIVE — the defensive grab must END the quad
+      await freshQuad(A);
+      await sleep(gap);
+      await grabDefensive(A, d.pad, d.kind);
+      await sleep(200);
+      // order 2: the DEFENSIVE first, then QUAD — the quad grab must STRIP the defensive
+      await grabDefensive(A, d.pad, d.kind);
+      await sleep(gap);
+      await freshQuad(A);
+      await sleep(200);
     }
-    ok(inReady === 0, `PAD-PHASE: armor pad NEVER respawns during the quad READY window (${inReady}/${samples} in-window)`);
-    ok(aligned === samples, `PAD-PHASE: every armor respawn lands on the quad anti-phase slot (${aligned}/${samples} at +½ cycle)`);
-    ok(QUAD_HALF_CYCLE_MS >= POWERUP.QUAD_READY_MS, `PAD-PHASE: half-cycle offset (${QUAD_HALF_CYCLE_MS}ms) clears the READY window (${POWERUP.QUAD_READY_MS}ms) by construction`); }
+    const bad = A.selfHist.filter((s) => s.quad > 0 && (s.armor > 0 || s.hp > POWERUP.HEALTH_MAX));
+    ok(A.selfHist.length > 60, `OVERLAP: sampled ${A.selfHist.length} authoritative STATE frames across the grab schedule`);
+    ok(bad.length === 0, `OVERLAP: ZERO double-buff frames — never quad>0 while armor>0 or hp>100 (${bad.length} violations / ${A.selfHist.length} frames)`); }
+
+  // ---- (e) TRADE FIRES — both orders, both defensive kinds. Each trade must flip the state AND
+  //         announce itself via S2C.POWERUP `traded` (an unannounced swap reads as a bug). ------
+  { // quad -> grab ARMOR : armor up, quad ends, POWERUP carried traded:'quad'
+    await freshQuad(A);
+    let n = A.powerups.length;
+    await grabDefensive(A, PADS.armor, 'armor');
+    let s = st(A, A.id);
+    ok((s.armor || 0) > 0 && (s.quad || 0) === 0, `TRADE quad→armor: armor up (${s.armor}), quad ended (${s.quad}ms)`);
+    ok(A.powerups.slice(n).some((p) => p.kind === 'armor' && p.by === A.id && p.traded === 'quad'), `TRADE quad→armor broadcast traded:'quad'`);
+
+    // ARMOR -> grab QUAD : quad up, armor stripped to 0, hp<=100, POWERUP carried traded:'defensive'
+    n = A.powerups.length;
+    await freshQuad(A);                                            // A still holds the armor from above
+    s = st(A, A.id);
+    ok((s.quad || 0) > 0 && (s.armor || 0) === 0 && (s.hp || 0) <= POWERUP.HEALTH_MAX,
+      `TRADE armor→quad: quad up (${s.quad}ms), armor stripped (${s.armor}), hp clamped (${s.hp})`);
+    ok(A.powerups.slice(n).some((p) => p.kind === 'quad' && p.by === A.id && p.traded === 'defensive'), `TRADE armor→quad broadcast traded:'defensive'`);
+
+    // quad -> grab MEGA : overheal up (hp>100), quad ends, POWERUP carried traded:'quad'
+    await freshQuad(A);
+    n = A.powerups.length;
+    await grabDefensive(A, PADS.mega, 'mega');
+    s = st(A, A.id);
+    ok((s.hp || 0) > POWERUP.HEALTH_MAX && (s.quad || 0) === 0, `TRADE quad→mega: overheal up (hp ${s.hp}), quad ended (${s.quad}ms)`);
+    ok(A.powerups.slice(n).some((p) => p.kind === 'mega' && p.by === A.id && p.traded === 'quad'), `TRADE quad→mega broadcast traded:'quad'`);
+
+    // OVERHEAL -> grab QUAD : quad up, hp clamps to 100, POWERUP carried traded:'defensive'
+    n = A.powerups.length;
+    await freshQuad(A);                                            // A still carries the mega overheal from above
+    s = st(A, A.id);
+    ok((s.quad || 0) > 0 && (s.hp || 0) <= POWERUP.HEALTH_MAX, `TRADE overheal→quad: quad up (${s.quad}ms), hp clamped to ${s.hp}`);
+    ok(A.powerups.slice(n).some((p) => p.kind === 'quad' && p.by === A.id && p.traded === 'defensive'), `TRADE overheal→quad broadcast traded:'defensive'`);
+
+    // CONTROL — ammo is NOT a defensive: a real ammo grab must NOT end a live quad or flag a trade.
+    A.send({ t: C2S.SWITCH, weapon: 'carbine' }); await sleep(120);
+    await freshQuad(A);
+    for (let i = 0; i < 3; i++) { A.send({ t: C2S.SHOOT, ang: 0 }); await sleep(CARB.rateMs + 60); }   // drain the mag so the ammo pad actually grabs
+    n = A.powerups.length;
+    await grabDefensive(A, PADS.ammo, 'ammo');
+    s = st(A, A.id);
+    ok(A.powerups.slice(n).some((p) => p.kind === 'ammo' && p.by === A.id), 'CONTROL: A actually grabbed the ammo pad');
+    ok((s.quad || 0) > 0 && !A.powerups.slice(n).some((p) => p.traded), `CONTROL: an ammo grab did NOT end the quad (still ${s.quad}ms, no trade flagged)`);
+    // CONTROL — plain +health is NOT a defensive either: stepping on it (a no-op at full hp) never trades.
+    await grab(A, PADS.health, 400);
+    ok((st(A, A.id).quad || 0) > 0, 'CONTROL: the plain health pad never interacts with the quad'); }
 
   A.close(); B.close();
   console.log(`\n${pass} passed, ${fail} failed`);

@@ -80,6 +80,7 @@ const weaponSpots = world.pickups.filter((p) => p.kind === 'weapon');
 const itemSpots = world.pickups.filter((p) => p.kind === 'health' || p.kind === 'armor' || p.kind === 'ammo');
 const pickupTaken = new Map();                 // pickup id -> true while grabbed (pad dark)
 let pickupToast = { text: '', until: 0 };      // brief "PICKED UP <NAME>" banner
+let lastTradeEvent = null;                     // last SYMMETRIC-TRADE toast I fired (sticky; QA reads it via __game.lastTrade)
 // per-kind billboard colour + short label for the sustain items above.
 const ITEM_STYLE = {
   health: { rgb: [90, 240, 130], label: '+HEALTH' },
@@ -1298,6 +1299,10 @@ function playSynth(kind, loud = true) {
     synthTone(ctx, t0, 174, 0.5, 'sawtooth', v, 349);
     synthTone(ctx, t0 + 0.02, 261, 0.5, 'sawtooth', v * 0.8, 523);
     synthTone(ctx, t0 + 0.24, 392, 0.42, 'square', v * 0.6, 784);
+  } else if (kind === 'trade') {                           // THE SYMMETRIC TRADE — the quad chord, darkened + FALLING (one buff spent for the other)
+    synthTone(ctx, t0, 174, 0.4, 'sawtooth', v * 0.9, 116);
+    synthTone(ctx, t0 + 0.02, 261, 0.4, 'sawtooth', v * 0.6, 174);
+    synthTone(ctx, t0 + 0.2, 330, 0.3, 'square', v * 0.45, 220);
   } else if (kind === 'mega') {                            // warm ascending two-tone
     synthTone(ctx, t0, 330, 0.22, 'sine', v, 494);
     synthTone(ctx, t0 + 0.13, 494, 0.3, 'sine', v, 659);
@@ -1344,6 +1349,18 @@ Net.on(S2C.PICKUP, (m) => { pickupTaken.set(m.id, !!m.taken); });
 // announces to everyone (a fainter cue) so the room knows the carrier is out there.
 Net.on(S2C.POWERUP, (m) => {
   const mine = m.by === me.id;
+  // THE SYMMETRIC TRADE — grabbing one buff SPENT the other (server flags `traded`). An
+  // unannounced swap reads as a bug, so call it out explicitly both ways + a darker 'trade' cue.
+  // (The purple carrier tint + holder countdown drop on their own via STATE the instant quad ends.)
+  if (mine && m.traded) {
+    const label = m.traded === 'quad'
+      ? `◈ QUAD SPENT — ${m.kind === 'mega' ? 'MEGA' : 'ARMOR'} UP`   // spent the quad to take a defensive
+      : 'PLATES SPENT — ◈ QUAD DAMAGE';                               // spent the defensive to take the quad
+    pickupToast = { text: label, until: performance.now() + 2200 };
+    lastTradeEvent = { traded: m.traded, kind: m.kind, text: label, at: performance.now() };
+    playSynth('trade', true);
+    return;
+  }
   const label = m.kind === 'quad' ? 'QUAD DAMAGE' : (ITEM_STYLE[m.kind]?.label || 'PICKUP');
   if (mine) { pickupToast = { text: label, until: performance.now() + 1800 }; playSynth(m.kind, true); }
   else if (m.kind === 'quad') playSynth('quad', false);
@@ -1806,6 +1823,8 @@ window.__game = {
   get hp() { return me._hp ?? 100; },
   get armor() { return me._armor ?? 0; },            // QA: authoritative armor plates
   get quadMs() { return me._quad ?? 0; },            // QA: ms of QUAD damage left on ME (0 = none)
+  get toast() { return pickupToast.until > performance.now() ? pickupToast.text : ''; }, // QA: active pickup/trade toast text ('' when none)
+  get lastTrade() { return lastTradeEvent; },        // QA: last SYMMETRIC-TRADE I fired { traded, kind, text, at } (sticky; null if none)
   get frags() { return me._frags ?? 0; },
   get x() { return me.x; },
   get y() { return me.y; },
