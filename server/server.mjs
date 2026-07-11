@@ -21,7 +21,7 @@ import { WebSocketServer } from 'ws';
 import {
   C2S, S2C, TICK_HZ, RESPAWN_MS, PLAYER_HP, HIT_RADIUS,
   WEAPONS, DEFAULT_WEAPON, STARTING_WEAPONS, WEAPON_PICKUP_RESPAWN_MS,
-  WEAPON_PICKUP_RADIUS, PLAYER_COLORS, PROTOCOL_VERSION, OBJECTIVE,
+  WEAPON_PICKUP_RADIUS, PLAYER_COLORS, PROTOCOL_VERSION, OBJECTIVE, POWERUP,
 } from '../shared/protocol.js';
 import { compileMap, raycast, pickArena, isSolidCell } from '../shared/map.js';
 import { createBot } from '../client/js/bot.js';   // the ?bot=1 brain, reused verbatim server-side
@@ -58,6 +58,7 @@ const BOT_NAMES = ['VEX', 'HELIX', 'NOVA', 'RAZR', 'ONYX', 'ZEPH', 'KILO', 'JINX
 const bots = new Map();              // id -> bot record (a subset of `players`)
 let botNameIx = 0;
 let botLast = 0;                     // timestamp of the last bot tick (for dt)
+let simLast = 0;                     // timestamp of the last authoritative tick (overheal-decay dt)
 
 function pickSpawn() {
   // round-robin through the named spawns, nudged so two joins in a row differ
@@ -82,7 +83,7 @@ function makePlayer(ws) {
   return {
     id, ws, color, name: `player${id}`,
     x: spawn.x, y: spawn.y, ang: spawn.ang,
-    hp: PLAYER_HP, frags: 0, dead: false,
+    hp: PLAYER_HP, armor: 0, quadUntil: 0, frags: 0, dead: false,   // armor plates + quad expiry (Date.now)
     moving: 0,
     weapon: lo.weapon, clips: lo.clips,   // current weapon + per-weapon ammo
     lastShot: 0, reloadUntil: 0, respawnAt: 0, fireT: 1e9, chargeStart: 0,
@@ -109,13 +110,17 @@ function giveWeapon(p, key, { switchTo = true } = {}) {
   return true;
 }
 
-// public view of a player (what everybody else is allowed to see)
+// public view of a player (what everybody else is allowed to see). hp/armor are the
+// authoritative combat totals; `quad` (ms left) lets every client tint the carrier's
+// billboard and the holder render their own countdown — no separate powerup snapshot.
 function stateOf(p) {
+  const now = Date.now();
   return {
     id: p.id, name: p.name, color: p.color,
     x: +p.x.toFixed(3), y: +p.y.toFixed(3), ang: +p.ang.toFixed(3),
-    hp: p.hp, frags: p.frags, dead: p.dead,
-    fireT: p.fireT, reloading: Date.now() < p.reloadUntil,
+    hp: Math.round(p.hp), armor: Math.round(p.armor), frags: p.frags, dead: p.dead,
+    fireT: p.fireT, reloading: now < p.reloadUntil,
+    quad: p.quadUntil > now ? p.quadUntil - now : 0,
   };
 }
 
@@ -130,7 +135,7 @@ function broadcast(msg) {
 function respawn(p) {
   const spawn = pickSpawn();
   p.x = spawn.x; p.y = spawn.y; p.ang = spawn.ang;
-  p.hp = PLAYER_HP; p.dead = false;
+  p.hp = PLAYER_HP; p.armor = 0; p.quadUntil = 0; p.dead = false;   // fresh: no plates, no quad, no overheal
   const lo = freshLoadout(); p.weapon = lo.weapon; p.clips = lo.clips;   // drop picked-up weapons
   p.reloadUntil = 0; p.respawnAt = 0; p.chargeStart = 0;
   broadcast({ t: S2C.SPAWN, id: p.id, x: p.x, y: p.y, ang: p.ang });
@@ -173,21 +178,85 @@ const OBJ = map.airlock ? {
 
 function objDist2(p, c) { const dx = p.x - c.x, dy = p.y - c.y; return dx * dx + dy * dy; }
 
-// --- WEAPON PICKUPS: server-authoritative grab + respawn --------------------
-// One state record per `{ kind:'weapon' }` entity in the compiled deck. A live
-// player who walks within WEAPON_PICKUP_RADIUS grabs it (giveWeapon + switch),
-// the pad goes dark for WEAPON_PICKUP_RESPAWN_MS, then respawns. Availability is
-// pushed to clients as edge events (S2C.PICKUP) + seeded in the welcome snapshot.
+// --- PICKUPS: server-authoritative grab + respawn ---------------------------
+// One state record per pickup entity in the compiled deck. A live player who walks
+// within its radius grabs it, the pad goes dark for a respawn window, then reappears.
+// Availability is pushed to clients as edge events (S2C.PICKUP) + seeded in welcome;
+// the EFFECT (weapon / hp / armor / ammo / quad) is applied here, authoritatively.
+//   weapon  -> giveWeapon + switch (as before)
+//   health  -> +25 to 100  (or, `mega`, +100 to a 200 overheal that decays back to 100)
+//   armor   -> +50 to 100  (soaks a share of incoming damage; see applyHit)
+//   ammo    -> tops off the CURRENT weapon's magazine
+//   quad    -> the timed damage multiplier (telegraphed; grab gated to the glow window)
+//
+// TEST KNOBS (env, off in prod — the live units don't set them): shorten the item respawn
+// and quad duration, and force the quad always-grabbable, so tools/powerups-test.mjs can
+// prove decay/respawn/expiry without waiting out the 25s/22s/30s live clocks.
+const ITEM_RESPAWN_MS = +(process.env.STARFRAG_ITEM_RESPAWN_MS || POWERUP.ITEM_RESPAWN_MS);
+const QUAD_MS = +(process.env.STARFRAG_QUAD_MS || POWERUP.QUAD_MS);
+const QUAD_ALWAYS = !!(+process.env.STARFRAG_QUAD_ALWAYS || 0);
+
 const weaponPickups = map.pickups
   .filter((pk) => pk.kind === 'weapon' && WEAPONS[pk.weapon])
-  .map((pk) => ({ id: pk.id, x: pk.x, y: pk.y, weapon: pk.weapon, taken: false, respawnAt: 0 }));
+  .map((pk) => ({ id: pk.id, kind: 'weapon', x: pk.x, y: pk.y, weapon: pk.weapon, taken: false, respawnAt: 0 }));
+// health/armor/ammo pads (instant effects). `mega` health overheals + decays.
+const itemPickups = map.pickups
+  .filter((pk) => pk.kind === 'health' || pk.kind === 'armor' || pk.kind === 'ammo')
+  .map((pk) => ({ id: pk.id, kind: pk.kind, mega: !!pk.mega, x: pk.x, y: pk.y, taken: false, respawnAt: 0 }));
+// THE QUAD — at most one per deck. Grabbable only inside its telegraph glow window (so the
+// grab lines up with the "QUAD UP" clock every client already shows), then the pad stays
+// dark until the next window. `quadDarkUntil` = when it can reappear (grabbed → next cycle).
+const quadPad = (map.pickups.find((pk) => pk.kind === 'quad')) || null;
+const quad = quadPad ? { id: quadPad.id, x: quadPad.x, y: quadPad.y, taken: false } : null;
+let quadDarkUntil = 0;
 const WPICK_R2 = WEAPON_PICKUP_RADIUS * WEAPON_PICKUP_RADIUS;
+const IPICK_R2 = POWERUP.PICKUP_RADIUS * POWERUP.PICKUP_RADIUS;
+
+// Is the quad's telegraph window open right now? Wall-clock cycle, identical to the client's
+// quadState() — so server truth and client telegraph never disagree (QUAD_ALWAYS in tests).
+function quadWindowOpen(now) {
+  return QUAD_ALWAYS || (now % POWERUP.QUAD_CYCLE_MS) < POWERUP.QUAD_READY_MS;
+}
+// Start of the next telegraph cycle — how long the pad stays dark after a grab (live).
+function nextCycleStart(now) { return Math.ceil((now + 1) / POWERUP.QUAD_CYCLE_MS) * POWERUP.QUAD_CYCLE_MS; }
 
 function pickupsView() {
-  return weaponPickups.map((pk) => ({ id: pk.id, weapon: pk.weapon, taken: pk.taken }));
+  const v = [
+    ...weaponPickups.map((pk) => ({ id: pk.id, kind: 'weapon', weapon: pk.weapon, taken: pk.taken })),
+    ...itemPickups.map((pk) => ({ id: pk.id, kind: pk.kind, mega: pk.mega, taken: pk.taken })),
+  ];
+  if (quad) v.push({ id: quad.id, kind: 'quad', taken: quad.taken });
+  return v;
+}
+
+// Apply an instant item's effect. Returns true if it was actually consumed (a full-HP
+// player walking over a health pad leaves it for someone who needs it — classic).
+function applyItem(p, pk, now) {
+  if (pk.kind === 'health') {
+    const max = pk.mega ? POWERUP.MEGA_MAX : POWERUP.HEALTH_MAX;
+    const add = pk.mega ? POWERUP.MEGA_ADD : POWERUP.HEALTH_ADD;
+    if (p.hp >= max) return false;
+    p.hp = Math.min(max, p.hp + add);
+    return true;
+  }
+  if (pk.kind === 'armor') {
+    if (p.armor >= POWERUP.ARMOR_MAX) return false;
+    p.armor = Math.min(POWERUP.ARMOR_MAX, p.armor + POWERUP.ARMOR_ADD);
+    return true;
+  }
+  if (pk.kind === 'ammo') {
+    const wp = WEAPONS[p.weapon] || WEAPONS[DEFAULT_WEAPON];
+    if ((p.clips[p.weapon] || 0) >= wp.clip) return false;   // mag already full
+    p.clips[p.weapon] = wp.clip;
+    p.reloadUntil = 0;                                        // a fresh mag cancels a reload
+    sendWeapon(p);
+    return true;
+  }
+  return false;
 }
 
 function updatePickups(now) {
+  // weapon pads (grab + switch)
   for (const pk of weaponPickups) {
     if (pk.taken) {
       if (now >= pk.respawnAt) { pk.taken = false; broadcast({ t: S2C.PICKUP, id: pk.id, taken: false }); }
@@ -204,6 +273,56 @@ function updatePickups(now) {
       broadcast({ t: S2C.PICKUP, id: pk.id, taken: true });
       break;   // one grab per pad per tick
     }
+  }
+  // sustain pads (health/armor/ammo) — instant effect, then a timed respawn
+  for (const pk of itemPickups) {
+    if (pk.taken) {
+      if (now >= pk.respawnAt) { pk.taken = false; broadcast({ t: S2C.PICKUP, id: pk.id, taken: false }); }
+      continue;
+    }
+    for (const p of players.values()) {
+      if (!p.joined || p.dead) continue;
+      const dx = p.x - pk.x, dy = p.y - pk.y;
+      if (dx * dx + dy * dy > IPICK_R2) continue;
+      if (!applyItem(p, pk, now)) continue;   // no effect (already capped) → leave the pad up
+      pk.taken = true; pk.respawnAt = now + ITEM_RESPAWN_MS;
+      broadcast({ t: S2C.PICKUP, id: pk.id, taken: true });
+      broadcast({ t: S2C.POWERUP, kind: pk.mega ? 'mega' : pk.kind, id: pk.id, by: p.id });
+      break;
+    }
+  }
+  // THE QUAD — grabbable only inside its telegraph window; grants the timed multiplier.
+  // `quad.taken` means GRABBED (dark until the next telegraph cycle) — NOT merely "window
+  // closed": the client already renders the dim build-up telegraph off the shared wall clock,
+  // so we only flip `taken` on a real grab, else the pillar would blink every cycle.
+  if (quad) {
+    if (quad.taken && now >= quadDarkUntil) {         // cooldown over → the pad returns
+      quad.taken = false;
+      broadcast({ t: S2C.PICKUP, id: quad.id, taken: false });
+    }
+    if (!quad.taken && quadWindowOpen(now)) {
+      for (const p of players.values()) {
+        if (!p.joined || p.dead) continue;
+        const dx = p.x - quad.x, dy = p.y - quad.y;
+        if (dx * dx + dy * dy > IPICK_R2) continue;
+        p.quadUntil = now + QUAD_MS;                  // grant / refresh
+        quad.taken = true;
+        quadDarkUntil = QUAD_ALWAYS ? now + 1500 : nextCycleStart(now);   // dark till the next telegraph window (live)
+        broadcast({ t: S2C.PICKUP, id: quad.id, taken: true });
+        broadcast({ t: S2C.POWERUP, kind: 'quad', id: quad.id, by: p.id });
+        break;
+      }
+    }
+  }
+}
+
+// Overheal bleed: any hp above 100 decays back at MEGA_DECAY/s (mega-health only pushes
+// hp past 100). Runs on the authoritative tick; `dt` is seconds since the last tick.
+function decayOverheal(dt) {
+  const drop = POWERUP.MEGA_DECAY * dt;
+  for (const p of players.values()) {
+    if (p.dead) continue;
+    if (p.hp > POWERUP.HEALTH_MAX) p.hp = Math.max(POWERUP.HEALTH_MAX, p.hp - drop);
   }
 }
 
@@ -296,10 +415,21 @@ function updateObjective(now) {
 // Apply one hit (damage + death/frag broadcast). Shared by the nearest-body path and
 // the railgun's pierce path (which calls it once per body along the ray).
 function applyHit(shooter, target, dmg, weaponKey, now) {
-  target.hp = Math.max(0, target.hp - dmg);
-  broadcast({ t: S2C.HIT, id: target.id, by: shooter.id, dmg, hp: target.hp });
+  // QUAD — the SHOOTER's timed damage multiplier (server-timed; a client can't fake it).
+  if (shooter.quadUntil > now) dmg = Math.round(dmg * POWERUP.QUAD_MULT);
+  // ARMOR — the TARGET's plates soak a fraction of the blow before it reaches HP; when the
+  // plates run out the overflow carries through. `dmg` reported to clients is the total dealt.
+  if (target.armor > 0 && dmg > 0) {
+    const absorbed = Math.min(target.armor, Math.round(dmg * POWERUP.ARMOR_ABSORB));
+    target.armor -= absorbed;
+    target.hp = Math.max(0, target.hp - (dmg - absorbed));
+  } else {
+    target.hp = Math.max(0, target.hp - dmg);
+  }
+  broadcast({ t: S2C.HIT, id: target.id, by: shooter.id, dmg, hp: Math.round(target.hp), armor: Math.round(target.armor) });
   if (target.hp <= 0 && !target.dead) {
     target.dead = true;
+    target.armor = 0; target.quadUntil = 0;   // death ends the quad (drops nothing) + strips plates
     target.respawnAt = now + RESPAWN_MS;
     shooter.frags++;
     broadcast({
@@ -394,7 +524,7 @@ function makeBot() {
   const bot = {
     id, ws: BOT_WS, color, name: BOT_NAMES[botNameIx++ % BOT_NAMES.length],
     x: spawn.x, y: spawn.y, ang: spawn.ang,
-    hp: PLAYER_HP, frags: 0, dead: false, moving: 0,
+    hp: PLAYER_HP, armor: 0, quadUntil: 0, frags: 0, dead: false, moving: 0,   // bots grab items too (visible to humans via STATE)
     weapon: lo.weapon, clips: lo.clips,
     lastShot: 0, reloadUntil: 0, respawnAt: 0, fireT: 1e9, chargeStart: 0,
     joined: true, isBot: true, _botF: 0, _botS: 0,
@@ -584,14 +714,17 @@ setInterval(() => {
   // EMPTY-SERVER GUARD: with nobody connected (no humans AND — after despawn-on-empty —
   // no bots), skip the whole tick: no sim, no JSON.stringify, no broadcast. The interval
   // keeps firing, so this re-arms the instant a client connects (players.size ≥ 1). (smcgrl)
-  if (players.size === 0) return;
+  if (players.size === 0) { simLast = 0; return; }
   const now = Date.now();
+  const dt = simLast ? Math.min(0.25, (now - simLast) / 1000) : 1 / TICK_HZ;
+  simLast = now;
   for (const p of players.values()) {
     if (p.dead && p.respawnAt && now >= p.respawnAt) respawn(p);
   }
   updateBots(now);       // drive in-process bot AI (no-op when no bots are live)
   updateObjective(now);
   updatePickups(now);
+  decayOverheal(dt);     // mega-health overheal bleeds back to 100
   broadcast({ t: S2C.STATE, players: [...players.values()].filter((p) => p.joined).map(stateOf) });
   if (OBJ) broadcast({ t: S2C.OBJECTIVE, ...objectiveView(now) });
 }, 1000 / TICK_HZ);

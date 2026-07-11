@@ -411,7 +411,7 @@ export const DECK7V2 = {
     { id: 'weapon-scatter', type: 'pickup', kind: 'weapon', weapon: 'scatter', x: 28.5, y: 18.5 }, // deep in the cargo maze (E)
     // SUSTAIN — at the edges, off the ring (billboards; health/armor/ammo/quad wiring
     // is the same pre-existing "separate feature" as on deck7 — placed to the design).
-    { id: 'pickup-cargo-mega',  type: 'pickup', kind: 'health', x: 25.5, y: 13.5 }, // cargo mega-health
+    { id: 'pickup-cargo-mega',  type: 'pickup', kind: 'health', mega: true, x: 25.5, y: 13.5 }, // cargo MEGA-health (overheals to 200, decays)
     { id: 'pickup-dock-armor',  type: 'pickup', kind: 'armor',  x: 17.5, y: 28.5 }, // docking armor
     { id: 'pickup-dock-ammo',   type: 'pickup', kind: 'ammo',   x: 12.5, y: 28.5 }, // docking ammo
     { id: 'pickup-eng-health',  type: 'pickup', kind: 'health', x: 2.5,  y: 19.5 }, // engineering health
@@ -499,8 +499,10 @@ export function compileMap(arena = ARENA) {
         spawns.push({ id: e.id, x: e.x, y: e.y, ang: e.ang || 0 });
         break;
       case 'pickup':
-        // weapon pickups carry a `weapon` key; health/armor carry only `kind`.
-        pickups.push({ id: e.id, kind: e.kind, x: e.x, y: e.y, weapon: e.weapon });
+        // weapon pickups carry a `weapon` key; sustain/quad carry `kind` (+ `mega` on the
+        // overheal health variant). The runtime pickup record is the single source both the
+        // server (grab/respawn/effect) and client (billboard) read from.
+        pickups.push({ id: e.id, kind: e.kind, x: e.x, y: e.y, weapon: e.weapon, mega: !!e.mega });
         break;
       // Airlock-objective entities. Consoles are floor devices (NOT put in the
       // grid — players stand on them to channel), the airlock is the vent region.

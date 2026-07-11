@@ -106,6 +106,33 @@ export const DEFAULT_WEAPON = 'carbine';
 // What every player spawns owning. Picked-up weapons are LOST on death (drop-on-death
 // arena rules), so the map pickups stay meaningful round to round.
 export const STARTING_WEAPONS = ['carbine'];
+
+// --- POWERUPS & SUSTAIN ITEMS (arena-shooter canon) -------------------------
+// Server-authoritative, shared so the client's HUD/telegraph never disagrees with the
+// server's hp/armor/damage math. Kinds: 'quad' (timed damage multiplier), 'health'
+// (instant +HP; the `mega` variant overheals + decays), 'armor' (absorbs a fraction of
+// incoming damage before HP), 'ammo' (tops off the current magazine). Placement comes
+// from the map data (shared/map.js); these are the numbers that make a grab MEAN something.
+export const POWERUP = {
+  // THE QUAD — a timed damage multiplier. Canon is 3-4x in the quake lineage; 3x fits
+  // STARFRAG's TTK. Carrier is visible (a purple tint on their billboard + a holder HUD
+  // countdown). It drops NOTHING on death — the effect just ends.
+  QUAD_MULT: 3,
+  QUAD_MS: 22000,                 // how long a grabbed quad lasts (server-timed)
+  // The QUAD is TELEGRAPHED: its pad glows on a fixed wall-clock cycle (up READY_MS every
+  // CYCLE_MS, glow-ramps RAMP_MS before) so every client agrees WHEN it's contested with
+  // no server message — and the SERVER gates the grab to the SAME window (authoritative).
+  QUAD_CYCLE_MS: 30000, QUAD_READY_MS: 10000, QUAD_RAMP_MS: 6000,
+  // MEGA-HEALTH: +100 up to a 200 overheal, then bleeds back to 100 at MEGA_DECAY/s.
+  MEGA_ADD: 100, MEGA_MAX: 200, MEGA_DECAY: 1,
+  // health: instant +25 up to the normal 100 cap.
+  HEALTH_ADD: 25, HEALTH_MAX: 100,
+  // armor: +50 up to 100; soaks ARMOR_ABSORB of each incoming hit until it runs out.
+  ARMOR_ADD: 50, ARMOR_MAX: 100, ARMOR_ABSORB: 2 / 3,
+  // instant item pads (health/armor/ammo) go dark this long before respawning.
+  ITEM_RESPAWN_MS: 25000,
+  PICKUP_RADIUS: 0.75,            // walk this close (cells) to grab an item — matches weapons
+};
 // slot number -> weapon key (for number-key selection + cycle order)
 export const WEAPON_SLOTS = Object.fromEntries(
   Object.entries(WEAPONS).map(([k, w]) => [w.slot, k]));
@@ -126,12 +153,13 @@ export const C2S = {
 
 // Server -> Client
 export const S2C = {
-  WELCOME: 'welcome', // { id, spawn:{x,y,ang}, mapName, players:[state...] }
-  STATE:   'state',   // { players:[ {id,name,color,x,y,ang,hp,frags,dead,fireT,reloading} ] }
+  WELCOME: 'welcome', // { id, spawn:{x,y,ang}, mapName, players:[state...], pickups:[...] }
+  STATE:   'state',   // { players:[ {id,name,color,x,y,ang,hp,armor,frags,dead,fireT,reloading,quad} ] }  quad = ms of QUAD left (0 = none)
   SHOT:    'shot',    // { id, ang, weapon, charge? }  -> muzzle flash on `id`; charge (0..1) present for the railgun -> beam intensity
   WEAPON:  'weapon',  // { weapon, clip, owned:[keys] }  -> YOUR authoritative weapon/ammo changed
-  PICKUP:  'pickup',  // { id, taken }         -> a map weapon-pickup became (un)available
-  HIT:     'hit',     // { id, by, dmg, hp }   -> player `id` took damage from `by`
+  PICKUP:  'pickup',  // { id, taken }         -> a map pickup pad (weapon/item/quad) became (un)available
+  POWERUP: 'powerup', // { kind, id, by }      -> `by` grabbed a sustain/quad item (cue + toast; hp/armor/quad land via STATE)
+  HIT:     'hit',     // { id, by, dmg, hp, armor }  -> player `id` took damage from `by` (armor = their remaining plates)
   KILL:    'kill',    // { id, by, weapon, names:{id,by} }  -> killfeed entry
   SPAWN:   'spawn',   // { id, x, y, ang }     -> player (re)spawned
   LEAVE:   'leave',   // { id }

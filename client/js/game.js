@@ -8,7 +8,7 @@
 // every art path falls back to procedural shading until its asset loads. The map,
 // the wire protocol and the hitscan math all come from ../shared so client and
 // server agree exactly.
-import { WEAPONS, DEFAULT_WEAPON, WEAPON_SLOTS, C2S, S2C, OBJECTIVE } from '../shared/protocol.js';
+import { WEAPONS, DEFAULT_WEAPON, WEAPON_SLOTS, C2S, S2C, OBJECTIVE, POWERUP } from '../shared/protocol.js';
 import { compileMap, raycast, isSolidCell, TEX, pickArena } from '../shared/map.js';
 import { Net } from './net.js';
 import { createBot } from './bot.js';
@@ -75,17 +75,28 @@ const killfeed = [];                          // { text, until }
 // server-authoritative (seeded in welcome, toggled by S2C.PICKUP). The client only
 // renders the glowing pads and never decides a grab (server proximity owns that).
 const weaponSpots = world.pickups.filter((p) => p.kind === 'weapon');
+// sustain items (health / armor / ammo) — billboards in their kind's colour; availability
+// is server-authoritative (S2C.PICKUP), the effect lands as hp/armor via S2C.STATE.
+const itemSpots = world.pickups.filter((p) => p.kind === 'health' || p.kind === 'armor' || p.kind === 'ammo');
 const pickupTaken = new Map();                 // pickup id -> true while grabbed (pad dark)
 let pickupToast = { text: '', until: 0 };      // brief "PICKED UP <NAME>" banner
+// per-kind billboard colour + short label for the sustain items above.
+const ITEM_STYLE = {
+  health: { rgb: [90, 240, 130], label: '+HEALTH' },
+  mega:   { rgb: [120, 230, 255], label: 'MEGA HEALTH' },
+  armor:  { rgb: [120, 180, 255], label: '+ARMOR' },
+  ammo:   { rgb: [255, 210, 90],  label: '+AMMO' },
+};
+const itemStyleFor = (pk) => (pk.kind === 'health' && pk.mega) ? ITEM_STYLE.mega : ITEM_STYLE[pk.kind];
 
-// THE QUAD (deck7v2) — a TELEGRAPHED TIMED powerup: a far-corner pad that glows up on
-// a fixed cycle with a HUD clock ("QUAD 0:12"), so everyone knows WHEN it's contested
-// — the anti-snowball / casual on-ramp. The cycle is keyed to the WALL CLOCK so every
-// client agrees within a second (no server message). HONEST SCOPE: this is the
-// telegraph + marker only; the damage-multiplier EFFECT is deferred (it needs a
-// server powerup system, out of this deck's tightly-scoped brief).
+// THE QUAD (deck7v2) — a TELEGRAPHED TIMED powerup: a far-corner pad that glows up on a
+// fixed cycle with a HUD clock ("QUAD 0:12"), so everyone knows WHEN it's contested — the
+// anti-snowball / casual on-ramp. The cycle is keyed to the WALL CLOCK (shared constants,
+// so the SERVER gates the grab to the SAME window — telegraph and server truth agree). A
+// grabbed pad goes dark via S2C.PICKUP; the carrier's damage multiplier + billboard tint +
+// holder countdown are all driven by the server (STATE `quad` = ms left).
 const powerSpots = world.pickups.filter((p) => p.kind === 'quad');
-const QUAD_CYCLE_MS = 30000, QUAD_READY_MS = 10000, QUAD_RAMP_MS = 6000;   // up 10s every 30s; glow-ramps 6s before
+const QUAD_CYCLE_MS = POWERUP.QUAD_CYCLE_MS, QUAD_READY_MS = POWERUP.QUAD_READY_MS, QUAD_RAMP_MS = POWERUP.QUAD_RAMP_MS;
 function quadState() {
   const ph = Date.now() % QUAD_CYCLE_MS;
   const ready = ph < QUAD_READY_MS;
@@ -636,6 +647,9 @@ function render(t) {
     const cx0 = Math.max(0, x0), cx1 = Math.min(SCREEN_W, x1);
     const cyy0 = Math.max(0, yStart | 0), cyy1 = Math.min(SCREEN_H, yEnd | 0);
     const stepTX = spr.w / wPx, stepTY = spr.h / hPx;
+    // QUAD CARRIER — a pulsing purple wash over whoever the server says is holding it
+    // (STATE `quad` > 0), so every player can see the threat coming. Presentation only.
+    const qMix = (p.quad || 0) > 0 ? 0.42 + 0.16 * Math.sin(nowMs * 0.008) : 0;
     for (let x = cx0; x < cx1; x++) {
       if (ty >= zbuf[x]) continue;
       const sxp = ((x - x0) * stepTX) | 0;
@@ -645,9 +659,11 @@ function render(t) {
         const px = spr.px[((tyf | 0) * spr.w) + sxp];
         if ((px >>> 24) < 110) continue;
         const r = (px & 255), g = (px >> 8) & 255, b = (px >> 16) & 255;
-        fb[fi] = real
-          ? packRGB((r * m) | 0, (g * m) | 0, (b * m) | 0)
-          : packRGB((r * col[0] / 255 * m) | 0, (g * col[1] / 255 * m) | 0, (b * col[2] / 255 * m) | 0);
+        let rr, gg, bb;
+        if (real) { rr = r * m; gg = g * m; bb = b * m; }
+        else { rr = r * col[0] / 255 * m; gg = g * col[1] / 255 * m; bb = b * col[2] / 255 * m; }
+        if (qMix) { rr = rr * (1 - qMix) + QUAD_RGB[0] * qMix; gg = gg * (1 - qMix) + QUAD_RGB[1] * qMix; bb = bb * (1 - qMix) + QUAD_RGB[2] * qMix; }
+        fb[fi] = packRGB(rr | 0, gg | 0, bb | 0);
       }
     }
     // health bar
@@ -887,6 +903,49 @@ function render(t) {
     }
   }
 
+  // --- SUSTAIN ITEMS: health / armor / ammo / mega pads (available ones only) ---
+  // A hovering additive orb in the item's colour + a ground marker, depth-tested against
+  // the walls. Availability is server truth (pickupTaken); mega reads a brighter cyan.
+  for (const pk of itemSpots) {
+    if (pickupTaken.get(pk.id)) continue;
+    const st = itemStyleFor(pk); if (!st) continue;
+    const relX = pk.x - ex, relY = pk.y - ey;
+    const ptx = invDet * (dirY * relX - dirX * relY);
+    const pty = invDet * (-planeY * relX + planeX * relY);
+    if (pty <= 0.25 || pty > 36) continue;
+    const sx = (SCREEN_W / 2) * (1 + ptx / pty);
+    const ccol = Math.round(sx);
+    if (ccol < 0 || ccol >= SCREEN_W || pty >= zbuf[ccol]) continue;
+    const floorY = HORIZON + (0.5 * PROJ) / pty;
+    const bob = Math.sin(t * 2.6 + pk.x * 1.3) * 0.09;
+    const cy = HORIZON + ((0.5 - (0.32 + bob)) * PROJ) / pty;
+    const rad = Math.max(2, ((0.5 * PROJ) / pty) * 0.36);
+    const col = st.rgb;
+    const pulse = 0.6 + 0.4 * Math.sin(t * 4 + pk.x);
+    const r2 = rad * rad;
+    for (let yy = -rad; yy <= rad; yy++) {
+      const Y = (cy + yy) | 0; if (Y < 0 || Y >= SCREEN_H) continue;
+      for (let xx = -rad; xx <= rad; xx++) {
+        const X = (sx + xx) | 0; if (X < 0 || X >= SCREEN_W) continue;
+        if (pty >= zbuf[X]) continue;
+        const d2 = xx * xx + yy * yy; if (d2 > r2) continue;
+        const f = 1 - d2 / r2, core = d2 < r2 * 0.16 ? 1 : 0;
+        const i = Y * SCREEN_W + X, px = fb[i];
+        const ar = Math.min(255, col[0] * f * pulse + core * 150);
+        const ag = Math.min(255, col[1] * f * pulse + core * 150);
+        const ab = Math.min(255, col[2] * f * pulse + core * 150);
+        fb[i] = packRGB(Math.min(255, (px & 255) + ar) | 0, Math.min(255, ((px >> 8) & 255) + ag) | 0, Math.min(255, ((px >> 16) & 255) + ab) | 0);
+      }
+    }
+    const gy = floorY | 0;
+    for (let xx = -rad; xx <= rad; xx++) {
+      const X = (sx + xx) | 0; if (X < 0 || X >= SCREEN_W || gy < 0 || gy >= SCREEN_H) continue;
+      if (pty >= zbuf[X]) continue;
+      const i = gy * SCREEN_W + X, px = fb[i];
+      fb[i] = packRGB(Math.min(255, (px & 255) + col[0] * 0.4) | 0, Math.min(255, ((px >> 8) & 255) + col[1] * 0.4) | 0, Math.min(255, ((px >> 16) & 255) + col[2] * 0.4) | 0);
+    }
+  }
+
   // --- THE QUAD: a telegraphed powerup pad — a tall additive purple pillar of light
   // that is DIM while charging and blazes + pulses when READY (glow-ramp telegraph). ---
   if (powerSpots.length) {
@@ -894,6 +953,7 @@ function render(t) {
     const intensity = 0.18 + 0.82 * qs.ramp;                         // dim..bright over the ramp
     const pulse = qs.ready ? (0.7 + 0.3 * Math.sin(t * 7)) : 1;
     for (const pk of powerSpots) {
+      if (pickupTaken.get(pk.id)) continue;   // grabbed this cycle (server truth) → the pad is claimed
       const relX = pk.x - ex, relY = pk.y - ey;
       const ptx = invDet * (dirY * relX - dirX * relY);
       const pty = invDet * (-planeY * relX + planeX * relY);
@@ -1210,6 +1270,47 @@ function playSfx(name, vol = 0.5) {
   } catch {}
 }
 
+// Powerup cues are SYNTHESIZED (WebAudio) rather than sampled — short arena-shooter blips
+// with no asset files to ship. Same unlock gate as playSfx; bots stay silent.
+let _actx = null;
+function audioCtx() {
+  if (IS_BOT || !audioUnlocked) return null;
+  try {
+    if (!_actx) _actx = new (window.AudioContext || window.webkitAudioContext)();
+    if (_actx.state === 'suspended') _actx.resume().catch(() => {});
+    return _actx;
+  } catch { return null; }
+}
+function synthTone(ctx, t0, freq, dur, type, vol, freqEnd) {
+  const o = ctx.createOscillator(), g = ctx.createGain();
+  o.type = type; o.frequency.setValueAtTime(freq, t0);
+  if (freqEnd) o.frequency.exponentialRampToValueAtTime(freqEnd, t0 + dur);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(Math.max(0.0002, vol), t0 + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.connect(g); g.connect(ctx.destination);
+  o.start(t0); o.stop(t0 + dur + 0.03);
+}
+function playSynth(kind, loud = true) {
+  const ctx = audioCtx(); if (!ctx) return;
+  const t0 = ctx.currentTime, v = loud ? 0.24 : 0.1;
+  if (kind === 'quad') {                                   // ominous rising power chord
+    synthTone(ctx, t0, 174, 0.5, 'sawtooth', v, 349);
+    synthTone(ctx, t0 + 0.02, 261, 0.5, 'sawtooth', v * 0.8, 523);
+    synthTone(ctx, t0 + 0.24, 392, 0.42, 'square', v * 0.6, 784);
+  } else if (kind === 'mega') {                            // warm ascending two-tone
+    synthTone(ctx, t0, 330, 0.22, 'sine', v, 494);
+    synthTone(ctx, t0 + 0.13, 494, 0.3, 'sine', v, 659);
+  } else if (kind === 'armor') {                           // metallic clank
+    synthTone(ctx, t0, 220, 0.12, 'triangle', v, 330);
+    synthTone(ctx, t0 + 0.05, 440, 0.16, 'square', v * 0.5);
+  } else if (kind === 'ammo') {                            // mechanical chunk
+    synthTone(ctx, t0, 520, 0.07, 'square', v * 0.7, 300);
+  } else {                                                 // health — soft blip
+    synthTone(ctx, t0, 587, 0.14, 'sine', v, 880);
+  }
+}
+
 // ---------------------------------------------------------------- net effects
 Net.onWelcome = (m) => {
   me.id = m.id; me.x = m.spawn.x; me.y = m.spawn.y; me.ang = m.spawn.ang;
@@ -1237,8 +1338,16 @@ Net.on(S2C.WEAPON, (m) => {
     playSfx('switch', 0.5);
   }
 });
-// a map weapon-pickup became (un)available — toggle its pad
+// a map pickup pad (weapon/item/quad) became (un)available — toggle its pad
 Net.on(S2C.PICKUP, (m) => { pickupTaken.set(m.id, !!m.taken); });
+// someone grabbed a sustain/quad item — the grabber gets a toast + cue; a quad grab also
+// announces to everyone (a fainter cue) so the room knows the carrier is out there.
+Net.on(S2C.POWERUP, (m) => {
+  const mine = m.by === me.id;
+  const label = m.kind === 'quad' ? 'QUAD DAMAGE' : (ITEM_STYLE[m.kind]?.label || 'PICKUP');
+  if (mine) { pickupToast = { text: label, until: performance.now() + 1800 }; playSynth(m.kind, true); }
+  else if (m.kind === 'quad') playSynth('quad', false);
+});
 // server-authoritative objective state @20Hz — render only, decide nothing
 Net.on(S2C.OBJECTIVE, onObjective);
 Net.on(S2C.SHOT, (m) => {
@@ -1407,7 +1516,7 @@ function frame(now) {
 
   // read authoritative bits about myself from server state
   const mine = Net.players.get(me.id);
-  if (mine) { me.dead = mine.dead; me._hp = mine.hp; me._frags = mine.frags; }
+  if (mine) { me.dead = mine.dead; me._hp = mine.hp; me._frags = mine.frags; me._armor = mine.armor || 0; me._quad = mine.quad || 0; }
   if (me.dead && me.charging) cancelCharge();   // died mid-charge — drop the clock
 
   // reload completion (predicted; server also confirms via S2C.WEAPON)
@@ -1585,8 +1694,16 @@ function updateHUD() {
   const hp = me._hp ?? 100;
   $('hp').textContent = Math.max(0, hp | 0);
   const bar = $('hpbar').firstElementChild;
-  bar.style.width = Math.max(0, hp) + '%';
-  bar.style.background = hp > 55 ? '#ffb03a' : hp > 25 ? '#ff7a1a' : '#ff3c4a';
+  bar.style.width = Math.max(0, Math.min(100, hp)) + '%';   // overheal (>100) reads via colour, not an overflowing bar
+  bar.style.background = hp > 100 ? '#7ce6ff' : hp > 55 ? '#ffb03a' : hp > 25 ? '#ff7a1a' : '#ff3c4a';
+  // ARMOR — plates absorb ~2/3 of each hit until spent; dim the readout when empty
+  const armor = me._armor ?? 0;
+  const aw = $('armorwrap');
+  if (aw) {
+    $('armor').textContent = Math.max(0, armor | 0);
+    const abar = $('armorbar').firstElementChild; if (abar) abar.style.width = Math.max(0, Math.min(100, armor)) + '%';
+    aw.style.opacity = armor > 0 ? '0.95' : '0.28';
+  }
   $('ammo').textContent = me.dead ? '—' : me.clip;
   // weapon name (weapon-coloured); briefly flashes the "PICKED UP …" toast on a grab
   const wp = WEAPONS[me.weapon] || WEAPONS[DEFAULT_WEAPON];
@@ -1612,16 +1729,30 @@ function updateHUD() {
   updateObjectiveHUD();
   const vf = $('ventflash'); if (vf) vf.style.opacity = cam.ventFlash * 0.55;
 
-  // THE QUAD telegraph clock (only on decks with a quad — deck7v2)
+  // THE QUAD clock (only on decks with a quad — deck7v2). Three states, server-driven:
+  //   I'm the CARRIER  -> my remaining quad time, bright + pulsing;
+  //   someone else HAS it (pad grabbed) -> "HELD";
+  //   otherwise -> the wall-clock telegraph (up in / next in), matching the pad glow.
   const qc = $('quadclock');
   if (qc) {
     if (!powerSpots.length) qc.style.display = 'none';
     else {
-      const qs = quadState();
       qc.style.display = 'block';
-      qc.className = 'hud' + (qs.ready ? ' ready' : '');
-      const mm = Math.floor(qs.secs / 60), ss = String(qs.secs % 60).padStart(2, '0');
-      qc.textContent = qs.ready ? `◈ QUAD  UP · ${mm}:${ss}` : `◈ QUAD  ${mm}:${ss}`;
+      const myQuad = me._quad || 0;
+      const grabbed = powerSpots.some((pk) => pickupTaken.get(pk.id));
+      if (myQuad > 0) {
+        const s = Math.ceil(myQuad / 1000);
+        qc.className = 'hud ready';
+        qc.textContent = `◈ QUAD DAMAGE · 0:${String(s).padStart(2, '0')}`;
+      } else if (grabbed) {
+        qc.className = 'hud';
+        qc.textContent = '◈ QUAD  HELD';
+      } else {
+        const qs = quadState();
+        qc.className = 'hud' + (qs.ready ? ' ready' : '');
+        const mm = Math.floor(qs.secs / 60), ss = String(qs.secs % 60).padStart(2, '0');
+        qc.textContent = qs.ready ? `◈ QUAD  UP · ${mm}:${ss}` : `◈ QUAD  ${mm}:${ss}`;
+      }
     }
   }
 }
@@ -1673,6 +1804,8 @@ Net.connect(MY_NAME);
 window.__game = {
   get phase() { return me.dead ? 'dead' : 'playing'; },
   get hp() { return me._hp ?? 100; },
+  get armor() { return me._armor ?? 0; },            // QA: authoritative armor plates
+  get quadMs() { return me._quad ?? 0; },            // QA: ms of QUAD damage left on ME (0 = none)
   get frags() { return me._frags ?? 0; },
   get x() { return me.x; },
   get y() { return me.y; },
@@ -1695,6 +1828,7 @@ window.__game = {
   get owned() { return [...me.owned]; },             // QA: owned weapon keys
   get reloading() { return me.reloadUntil > performance.now(); },
   pickups() { return weaponSpots.map((p) => ({ id: p.id, weapon: p.weapon, taken: !!pickupTaken.get(p.id) })); },
+  items() { return [...itemSpots, ...powerSpots].map((p) => ({ id: p.id, kind: p.mega ? 'mega' : p.kind, taken: !!pickupTaken.get(p.id) })); }, // QA: sustain + quad pad state
   teleport(x, y, ang) { me.x = x; me.y = y; if (ang !== undefined) me.ang = ang; },
   setPos(x, y, ang) { this.teleport(x, y, ang); },
   fire() { me.fireT = -1e9; fire(); },

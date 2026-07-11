@@ -27,6 +27,12 @@
   #hp { font-size:30px; font-weight:bold; line-height:1; }
   #hpbar { width:150px; height:6px; margin-top:4px; background:#221; border:1px solid #443; }
   #hpbar i { display:block; height:100%; width:100%; background:var(--amber); }
+  /* ARMOR readout — sits just above INTEGRITY; dims to near-nothing at 0 plates */
+  #armorwrap { bottom:64px; left:16px; transition:opacity .2s; }
+  #armorwrap .lbl { font-size:10px; opacity:0.6; }
+  #armor { font-size:20px; font-weight:bold; line-height:1; color:#7ab0ff; }
+  #armorbar { width:150px; height:5px; margin-top:3px; background:#122033; border:1px solid #2b4a6b; }
+  #armorbar i { display:block; height:100%; width:0%; background:#5aa0ff; }
   #ammowrap { bottom:14px; right:16px; text-align:right; }
   #ammo { font-size:30px; font-weight:bold; line-height:1; }
   #ammowrap .lbl { font-size:10px; opacity:0.6; }
@@ -99,6 +105,11 @@
   <div class="hud" id="scoreboard"></div>
   <div class="hud" id="killfeed"></div>
 
+  <div class="hud" id="armorwrap">
+    <div class="lbl">ARMOR</div>
+    <div id="armor">0</div>
+    <div id="armorbar"><i></i></div>
+  </div>
   <div class="hud" id="hpwrap">
     <div class="lbl">INTEGRITY</div>
     <div id="hp">100</div>
@@ -122,4 +133,4 @@
 <script src="playtest-link.js?v=rec1"></script>
 <!-- ?v bumped on client changes: Cloudflare caches js/* for 5d, the HTML is served
      fresh (cf-cache DYNAMIC), so a new query key is how a client edit reaches users. -->
-<script type="module" src="js/game.js?v=deck7v2"></script>
+<script type="module" src="js/game.js?v=powerups"></script>

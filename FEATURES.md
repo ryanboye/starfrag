@@ -43,11 +43,11 @@ freely. Status: `open` · `claimed` · `in progress` · `done`. See
 
 | feature                                   | owner   | status |
 |-------------------------------------------|---------|--------|
-| Powerups (health/armor/quad) — wire pickups| _open_ | open   |
+| Powerups (health/armor/ammo/mega/quad) — wire pickups | BMO | done ✅ (server-authoritative: quad 3x damage + carrier tint/timer, mega overheal→decay, instant health/ammo, timed pad respawns; `tools/powerups-test.mjs`) |
 | Jump pads / zero-g zones                   | _open_ | open   |
 | Match timer + round win + intermission     | _open_ | open   |
 | Remote-player interpolation (smooth motion)| _open_ | open   |
-| Armor as a damage-absorbing stat           | _open_ | open   |
+| Armor as a damage-absorbing stat           | BMO    | done ✅ (soaks ~2/3 of each hit before HP, cap 100; HUD readout) |
 | Damage numbers (hit-markers ✅ shipped)     | _open_ | open   |
 | **Server-authoritative projectile travel** (bolts are client-visual v1 today — hits are still instant server hitscan; move spawn/advance/collide+damage onto server.mjs so bolts can be *really* dodged) | _open_ | open |
 | Airlock objective — arm 4 consoles, open bay-door, vent enemies out to win | seb | claimed |
