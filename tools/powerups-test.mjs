@@ -19,17 +19,19 @@
 //   Run: node tools/powerups-test.mjs      (spawns its own deck7v2 server on a test port)
 import { WebSocket } from 'ws';
 import { spawn } from 'child_process';
-const { WEAPONS, C2S, POWERUP } = await import('../shared/protocol.js');
+const { WEAPONS, C2S, POWERUP, nextDefensiveRespawn, quadReadyAt, QUAD_HALF_CYCLE_MS } = await import('../shared/protocol.js');
 
 const PORT = 8798, HOST = '127.0.0.1', WS = `ws://${HOST}:${PORT}`;
-const QUAD_MS = 2000, ITEM_RESPAWN_MS = 1500;
-const CARB = WEAPONS.carbine;
+// QUAD_MS is bumped past the live 22s only to shorten the EXPIRY wait; 3s also gives the charge-
+// weapon cross-product shots (a full railgun charge is ~1.1s of hold) comfortable headroom.
+const QUAD_MS = 3000, ITEM_RESPAWN_MS = 1500;
+const CARB = WEAPONS.carbine, RG = WEAPONS.railgun;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let pass = 0, fail = 0;
 const ok = (c, m) => { c ? pass++ : (fail++, console.log('  FAIL:', m)); if (c) console.log('  ok:', m); };
 
 // deck7v2 pad cells (shared/map.js) + a clean firing lane in engineering (row y=11 is open)
-const PADS = { quad: [2.5, 12.5], mega: [25.5, 13.5], armor: [17.5, 28.5], health: [2.5, 19.5], ammo: [12.5, 28.5] };
+const PADS = { quad: [2.5, 12.5], mega: [25.5, 13.5], armor: [17.5, 28.5], health: [2.5, 19.5], ammo: [12.5, 28.5], railgun: [13.5, 18.5] };
 const FIRE_A = [2.5, 11.5], FIRE_B = [4.5, 11.5];   // A fires +x (ang 0) at B, 2 cells away, open lane
 
 // --- spawn the arena server on a test port (deck7v2, no bots, powerup test knobs) ---
@@ -81,6 +83,22 @@ async function waitRespawn(obs, id, ms = 3200) {
   const end = Date.now() + ms;
   while (Date.now() < end) { if (st(obs, id).dead === false) return true; await sleep(80); }
   return false;
+}
+// (re)grab the quad and confirm a FRESH grant. Test mode = QUAD_ALWAYS, so it's always in-window
+// but dark ~1.5s after the last grab; retry across that cooldown until a near-full duration lands.
+async function freshQuad(A) {
+  const end = Date.now() + 5000;
+  while (Date.now() < end) {
+    await grab(A, PADS.quad, 300);
+    if ((st(A, A.id).quad || 0) >= QUAD_MS - 900) return true;   // a fresh grab (near-full life left)
+    await sleep(200);
+  }
+  return (st(A, A.id).quad || 0) > 0;
+}
+// walk onto a weapon pad until the server grants+switches to it (movement is client-auth here)
+async function grabWeapon(A, x, y, key) {
+  for (let i = 0; i < 40 && A.weapon !== key; i++) { A.move(x, y, 0); await sleep(75); }
+  return A.weapon === key;
 }
 
 async function main() {
@@ -188,6 +206,82 @@ async function main() {
     for (let i = 0; i < 4 && !postDmg; i++) { A.send({ t: C2S.SHOOT, ang: 0 }); await sleep(CARB.rateMs + 120);
       const h = A.hits.slice(nh).find((x) => x.id === B.id); if (h) postDmg = h.dmg; } }
   ok(postDmg > 0 && postDmg <= CARB.dmgHi, `after expiry damage returned to base: hit dealt ${postDmg} (<= ${CARB.dmgHi})`);
+
+  // ============================================================================================
+  // CROSS-PRODUCT (INTERACTION) TESTS — the reviewer's meta-point: the per-powerup tests above
+  // gate each effect in ISOLATION, but the balance bugs live in the INTERACTIONS (quad × a charge
+  // weapon, quad × armor). These drive the real combinations end-to-end.
+  // ============================================================================================
+
+  // ---- (a) QUAD × RAILGUN — the load-bearing bug. Un-capped, a quaded 250ms rail min-tap (34
+  //         dmg × mult) was a spammable wall-piercing one-shot. Both a min-tap AND a full charge
+  //         under quad must now stay <= the railgun's own dmgHi (the charge-weapon cap). --------
+  ok(await grabWeapon(A, ...PADS.railgun, 'railgun'), `QUADxRAIL: A picked up the railgun (clip ${A.clip})`);
+  await waitRespawn(A, B.id);
+  await freshQuad(A);
+  ok((st(A, A.id).quad || 0) > 0, `QUADxRAIL: A carries a fresh quad (${st(A, A.id).quad}ms)`);
+  await lineUp(A, B);
+  let rgMin = 0;
+  { const nh = A.hits.length; A.send({ t: C2S.CHARGE }); await sleep(RG.charge.minMs + 60); A.send({ t: C2S.SHOOT, ang: 0 }); await sleep(300);
+    const h = A.hits.slice(nh).find((x) => x.id === B.id); rgMin = h ? h.dmg : 0; }
+  ok(rgMin > 0 && rgMin <= RG.dmgHi, `QUADxRAIL min-tap under quad = ${rgMin} dmg (<= dmgHi ${RG.dmgHi}; NOT the old 100+ one-shot)`);
+  await waitRespawn(A, B.id); await freshQuad(A); await lineUp(A, B);   // reset (the min-tap may have killed B) so the full charge lands
+  let rgFull = 0;
+  { const nh = A.hits.length; A.send({ t: C2S.CHARGE }); await sleep(RG.charge.fullMs + 150); A.send({ t: C2S.SHOOT, ang: 0 }); await sleep(350);
+    const h = A.hits.slice(nh).find((x) => x.id === B.id); rgFull = h ? h.dmg : 0; }
+  ok(rgFull > 0 && rgFull <= RG.dmgHi, `QUADxRAIL full-charge under quad = ${rgFull} dmg (capped at dmgHi ${RG.dmgHi}; charge-commitment cost preserved)`);
+
+  // ---- (b) QUAD × CARBINE — the swing lever. A single quad carbine hit must not exceed
+  //         dmgHi*QUAD_MULT (rounded), and even under quad a kill still takes >= 2 hits (2.5x
+  //         compresses the fight, it does not delete it). ------------------------------------
+  A.send({ t: C2S.SWITCH, weapon: 'carbine' }); await sleep(120);
+  A.send({ t: C2S.RELOAD }); await sleep(CARB.reloadMs + 200);      // top the carbine mag
+  await waitRespawn(A, B.id);
+  await freshQuad(A);
+  await lineUp(A, B);
+  const capCarb = Math.round(CARB.dmgHi * POWERUP.QUAD_MULT);       // 30 * 2.5 = 75
+  let qcMax = 0, qcHits = 0, qcKilled = false;
+  { let nk = A.kills.length;
+    for (let i = 0; i < 6; i++) {
+      const nh = A.hits.length;
+      A.send({ t: C2S.SHOOT, ang: 0 }); await sleep(CARB.rateMs + 120);
+      const h = A.hits.slice(nh).find((x) => x.id === B.id);
+      if (h) { qcHits++; qcMax = Math.max(qcMax, h.dmg); }
+      if (A.kills.slice(nk).some((k) => k.id === B.id)) { qcKilled = true; break; }
+    } }
+  ok(qcMax > 0 && qcMax <= capCarb, `QUADxCARB single hit <= dmgHi*${POWERUP.QUAD_MULT} (${capCarb}): max quad hit ${qcMax}`);
+  ok(qcKilled && qcHits >= 2, `QUADxCARB a kill still needs >= 2 hits under quad (took ${qcHits})`);
+
+  // ---- (c) QUAD × ARMOR — combined-effects sanity. Quad + armor on one body is the god-combo;
+  //         an armored target must still SURVIVE at least one quad carbine hit (2/3 absorb behind
+  //         the multiplier), so the exchange isn't instantly decided. -------------------------
+  await waitRespawn(A, B.id);
+  A.send({ t: C2S.RELOAD }); await sleep(CARB.reloadMs + 200);      // top A's carbine again
+  await grab(B, PADS.armor);                                        // B grabs fresh plates
+  await freshQuad(A);
+  await lineUp(A, B);
+  ok((st(A, B.id).armor || 0) > 0, `QUADxARMOR: B carries armor (${st(A, B.id).armor} plates)`);
+  { const nh = A.hits.length; A.send({ t: C2S.SHOOT, ang: 0 }); await sleep(300);
+    const h = A.hits.slice(nh).find((x) => x.id === B.id);
+    ok(!!h, 'QUADxARMOR: A landed a quad carbine hit on the armored B');
+    const bs = st(A, B.id);
+    ok(bs.dead === false && (bs.hp || 0) > 0, `QUADxARMOR: armored B SURVIVES one quad carbine hit (hp ${bs.hp}, armor ${bs.armor})`); }
+
+  // ---- (d) PAD PHASE (clock simulation) — the anti-god-combo lever. Across a full quad cycle,
+  //         the defensive (armor/mega) pad's computed respawn must land on the quad's ANTI-PHASE
+  //         slot and NEVER inside the READY window, so fresh plates never co-refresh with a fresh
+  //         quad. Pure math over the shared clock — no wall-clock wait needed. -----------------
+  { const cyc = POWERUP.QUAD_CYCLE_MS;
+    let inReady = 0, aligned = 0, samples = 0;
+    for (let g = 0; g < cyc; g += 250) {                           // simulate a grab every 250ms across a cycle
+      const t = nextDefensiveRespawn(g + ITEM_RESPAWN_MS);         // respawn after a base dark window
+      samples++;
+      if (quadReadyAt(t)) inReady++;
+      if ((((t % cyc) + cyc) % cyc) === QUAD_HALF_CYCLE_MS) aligned++;
+    }
+    ok(inReady === 0, `PAD-PHASE: armor pad NEVER respawns during the quad READY window (${inReady}/${samples} in-window)`);
+    ok(aligned === samples, `PAD-PHASE: every armor respawn lands on the quad anti-phase slot (${aligned}/${samples} at +½ cycle)`);
+    ok(QUAD_HALF_CYCLE_MS >= POWERUP.QUAD_READY_MS, `PAD-PHASE: half-cycle offset (${QUAD_HALF_CYCLE_MS}ms) clears the READY window (${POWERUP.QUAD_READY_MS}ms) by construction`); }
 
   A.close(); B.close();
   console.log(`\n${pass} passed, ${fail} failed`);

@@ -22,6 +22,7 @@ import {
   C2S, S2C, TICK_HZ, RESPAWN_MS, PLAYER_HP, HIT_RADIUS,
   WEAPONS, DEFAULT_WEAPON, STARTING_WEAPONS, WEAPON_PICKUP_RESPAWN_MS,
   WEAPON_PICKUP_RADIUS, PLAYER_COLORS, PROTOCOL_VERSION, OBJECTIVE, POWERUP,
+  nextDefensiveRespawn,
 } from '../shared/protocol.js';
 import { compileMap, raycast, pickArena, isSolidCell } from '../shared/map.js';
 import { createBot } from '../client/js/bot.js';   // the ?bot=1 brain, reused verbatim server-side
@@ -203,6 +204,9 @@ const weaponPickups = map.pickups
 const itemPickups = map.pickups
   .filter((pk) => pk.kind === 'health' || pk.kind === 'armor' || pk.kind === 'ammo')
   .map((pk) => ({ id: pk.id, kind: pk.kind, mega: !!pk.mega, x: pk.x, y: pk.y, taken: false, respawnAt: 0 }));
+// The DEFENSIVE items — armor plates + mega-health overheal — are the survivability grabs the
+// anti-phasing (see updatePickups) locks to the quad's anti-phase slot. Plain health/ammo are not.
+function isDefensivePad(pk) { return pk.kind === 'armor' || (pk.kind === 'health' && pk.mega); }
 // THE QUAD — at most one per deck. Grabbable only inside its telegraph glow window (so the
 // grab lines up with the "QUAD UP" clock every client already shows), then the pad stays
 // dark until the next window. `quadDarkUntil` = when it can reappear (grabbed → next cycle).
@@ -285,7 +289,16 @@ function updatePickups(now) {
       const dx = p.x - pk.x, dy = p.y - pk.y;
       if (dx * dx + dy * dy > IPICK_R2) continue;
       if (!applyItem(p, pk, now)) continue;   // no effect (already capped) → leave the pad up
-      pk.taken = true; pk.respawnAt = now + ITEM_RESPAWN_MS;
+      pk.taken = true;
+      // ANTI-PHASING: armor + mega-health (the survivability items) respawn LOCKED to the quad's
+      // wall-clock cycle, offset a HALF cycle — the quad's anti-phase point — so fresh plates are
+      // never on the floor during the quad READY window (quad+armor on one body is near-unkillable;
+      // a free-run 25s drifts into phase with the 30s quad telegraph and they co-refresh). Plain
+      // health/ammo keep the free-running 25s. Skipped under QUAD_ALWAYS — a test knob that forces
+      // the quad permanently ready, so there's no anti-phase to align to and these free-run too.
+      pk.respawnAt = (isDefensivePad(pk) && !QUAD_ALWAYS)
+        ? nextDefensiveRespawn(now + ITEM_RESPAWN_MS)
+        : now + ITEM_RESPAWN_MS;
       broadcast({ t: S2C.PICKUP, id: pk.id, taken: true });
       broadcast({ t: S2C.POWERUP, kind: pk.mega ? 'mega' : pk.kind, id: pk.id, by: p.id });
       break;
@@ -416,7 +429,17 @@ function updateObjective(now) {
 // the railgun's pierce path (which calls it once per body along the ray).
 function applyHit(shooter, target, dmg, weaponKey, now) {
   // QUAD — the SHOOTER's timed damage multiplier (server-timed; a client can't fake it).
-  if (shooter.quadUntil > now) dmg = Math.round(dmg * POWERUP.QUAD_MULT);
+  if (shooter.quadUntil > now) {
+    dmg = Math.round(dmg * POWERUP.QUAD_MULT);
+    // CHARGE-WEAPON QUAD CAP: a charge weapon already BUYS its damage with hold time, so
+    // multiplying its post-roll damage double-dips — a cheap 250ms railgun min-tap (34 dmg) under
+    // quad would become a spammable wall-piercing one-shot. Cap quaded charge-weapon damage at the
+    // weapon's OWN full-charge ceiling (dmgHi): a min-tap tops out at ~85 (bumped, not lethal), a
+    // full charge stays 110, and the rail's charge-commitment cost is preserved. Do NOT cap non-
+    // charge weapons — that would nullify the quad, which is the entire point of a damage powerup.
+    const wp = WEAPONS[weaponKey];
+    if (wp && wp.charge) dmg = Math.min(dmg, wp.dmgHi);
+  }
   // ARMOR — the TARGET's plates soak a fraction of the blow before it reaches HP; when the
   // plates run out the overflow carries through. `dmg` reported to clients is the total dealt.
   if (target.armor > 0 && dmg > 0) {

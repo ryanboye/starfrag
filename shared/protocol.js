@@ -114,10 +114,14 @@ export const STARTING_WEAPONS = ['carbine'];
 // incoming damage before HP), 'ammo' (tops off the current magazine). Placement comes
 // from the map data (shared/map.js); these are the numbers that make a grab MEAN something.
 export const POWERUP = {
-  // THE QUAD — a timed damage multiplier. Canon is 3-4x in the quake lineage; 3x fits
-  // STARFRAG's TTK. Carrier is visible (a purple tint on their billboard + a holder HUD
-  // countdown). It drops NOTHING on death — the effect just ends.
-  QUAD_MULT: 3,
+  // THE QUAD — a timed damage multiplier. Canon is 3-4x in the quake lineage, but STARFRAG's
+  // carbine TTK is already short: at 3x the quad compressed a kill to a ~0.11-0.22s 2-tap for a
+  // WHOLE 22s window — a fight-deleter. 2.5x keeps the quad scary (still a decisive burst) without
+  // erasing the exchange. This multiplier is THE swing lever (one number, tuned here). Charge
+  // weapons additionally cap the post-multiply damage at their own dmgHi in server applyHit — see
+  // there — so a cheap railgun min-tap can't become a quaded one-shot. Carrier is visible (a purple
+  // tint on their billboard + a holder HUD countdown). It drops NOTHING on death — the effect ends.
+  QUAD_MULT: 2.5,
   QUAD_MS: 22000,                 // how long a grabbed quad lasts (server-timed)
   // The QUAD is TELEGRAPHED: its pad glows on a fixed wall-clock cycle (up READY_MS every
   // CYCLE_MS, glow-ramps RAMP_MS before) so every client agrees WHEN it's contested with
@@ -133,6 +137,27 @@ export const POWERUP = {
   ITEM_RESPAWN_MS: 25000,
   PICKUP_RADIUS: 0.75,            // walk this close (cells) to grab an item — matches weapons
 };
+
+// --- DEFENSIVE-PAD ANTI-PHASING (armor + mega-health) -----------------------
+// The QUAD telegraph is a wall-clock cycle: it's fresh/READY for QUAD_READY_MS at the top of
+// every QUAD_CYCLE_MS (the server grab-gate + the client telegraph both read this same clock).
+// The DEFENSIVE items (armor plates + mega-health overheal) are the survivability grabs, and
+// quad + one of them on the same body (⅔ absorb behind a big damage mult) is near-unkillable.
+// A plain free-run respawn drifts INTO phase with the quad cycle, so those two power spikes keep
+// co-refreshing. Instead the server locks the defensive respawn to the quad clock, offset a HALF
+// cycle — the quad's ANTI-PHASE point — so fresh plates are NEVER on the floor during the quad's
+// READY window. These pure helpers are the single source of that math (server + tests import them).
+export const QUAD_HALF_CYCLE_MS = POWERUP.QUAD_CYCLE_MS / 2;
+// Is the quad telegraph fresh/READY at wall-clock time t?
+export function quadReadyAt(t) { return (((t % POWERUP.QUAD_CYCLE_MS) + POWERUP.QUAD_CYCLE_MS) % POWERUP.QUAD_CYCLE_MS) < POWERUP.QUAD_READY_MS; }
+// Next defensive-pad respawn instant at/after `earliest`: the soonest time ≡ half-cycle (mod
+// cycle), i.e. the quad's anti-phase slot. Guaranteed outside the READY window by construction
+// (QUAD_HALF_CYCLE_MS 15s ≥ QUAD_READY_MS 10s).
+export function nextDefensiveRespawn(earliest) {
+  const cyc = POWERUP.QUAD_CYCLE_MS;
+  const k = Math.ceil((earliest - QUAD_HALF_CYCLE_MS) / cyc);
+  return k * cyc + QUAD_HALF_CYCLE_MS;
+}
 // slot number -> weapon key (for number-key selection + cycle order)
 export const WEAPON_SLOTS = Object.fromEntries(
   Object.entries(WEAPONS).map(([k, w]) => [w.slot, k]));
