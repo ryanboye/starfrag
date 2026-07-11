@@ -69,6 +69,13 @@ const vm = { flash: 0, kick: 0, rail: 0, railCf: 0 };   // viewmodel fx (rail = 
 const cross = { bloom: 0, hit: 0, kill: 0 };
 let started = IS_BOT;                          // bots skip the click-to-start gate
 const flashUntil = new Map();                 // playerId -> ms, remote muzzle flash
+// ENEMY HIT-FLASH — the instant "it landed" proof (P5, ranking #1). When any shot connects
+// (server broadcasts S2C.HIT with the target id) we stamp the victim here; drawSprites tints
+// their billboard hot-white for a couple frames, spiking to full then easing out ~100ms.
+const hitFlash = new Map();                    // playerId -> perf.now() of last hit
+const HITFLASH_TAU = 45;                       // ms — exp decay of the flash intensity (spike hard, recover slow)
+const HITFLASH_MAX = 120;                      // ms — drop the entry once the tail is spent
+const HITFLASH_RGB = [255, 210, 200];          // hot near-white w/ slight red bias — reads as damage, not muzzle
 const killfeed = [];                          // { text, until }
 
 // weapon pickups on the map. Positions come from the compiled deck; AVAILABILITY is
@@ -651,6 +658,15 @@ function render(t) {
     // QUAD CARRIER — a pulsing purple wash over whoever the server says is holding it
     // (STATE `quad` > 0), so every player can see the threat coming. Presentation only.
     const qMix = (p.quad || 0) > 0 ? 0.42 + 0.16 * Math.sin(nowMs * 0.008) : 0;
+    // HIT-FLASH — brief hot-white pop the instant a shot lands on this player. Composes
+    // ON TOP of the quad wash (a quad carrier who gets hit still flashes). (P5)
+    let fMix = 0;
+    const hf = hitFlash.get(p.id);
+    if (hf !== undefined) {
+      const age = nowMs - hf;
+      if (age >= HITFLASH_MAX) hitFlash.delete(p.id);
+      else fMix = Math.exp(-age / HITFLASH_TAU);
+    }
     for (let x = cx0; x < cx1; x++) {
       if (ty >= zbuf[x]) continue;
       const sxp = ((x - x0) * stepTX) | 0;
@@ -664,6 +680,7 @@ function render(t) {
         if (real) { rr = r * m; gg = g * m; bb = b * m; }
         else { rr = r * col[0] / 255 * m; gg = g * col[1] / 255 * m; bb = b * col[2] / 255 * m; }
         if (qMix) { rr = rr * (1 - qMix) + QUAD_RGB[0] * qMix; gg = gg * (1 - qMix) + QUAD_RGB[1] * qMix; bb = bb * (1 - qMix) + QUAD_RGB[2] * qMix; }
+        if (fMix) { rr = rr * (1 - fMix) + HITFLASH_RGB[0] * fMix; gg = gg * (1 - fMix) + HITFLASH_RGB[1] * fMix; bb = bb * (1 - fMix) + HITFLASH_RGB[2] * fMix; }
         fb[fi] = packRGB(rr | 0, gg | 0, bb | 0);
       }
     }
@@ -1377,6 +1394,10 @@ Net.on(S2C.SHOT, (m) => {
   else spawnBolt(sh.x, sh.y, m.ang, false);   // a plasma bolt travels from the enemy — you SEE it come
 });
 Net.on(S2C.HIT, (m) => {
+  // The victim's billboard flashes hot-white the instant the shot lands — the "it landed"
+  // proof that was missing. HIT is broadcast to everyone, so every client sees any trooper
+  // react (self is skipped in drawSprites; the local player uses the vignette below). (P5)
+  hitFlash.set(m.id, performance.now());
   // I took damage — punchy vignette + a flinch AWAY from the shooter's direction
   if (m.id === me.id) {
     cam.dmgFlash = Math.min(1, cam.dmgFlash + 0.6);
